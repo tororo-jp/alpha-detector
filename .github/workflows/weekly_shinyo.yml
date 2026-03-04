@@ -1,0 +1,28 @@
+name: Weekly Margin Data Update
+
+on:
+  schedule:
+    # 毎週火曜 17:30 JST (= UTC 08:30) に実行
+    # JPXが火曜16:30に公開するため、30分後に取得
+    - cron: '30 8 * * 2'
+  workflow_dispatch: # 手動実行（初回セットアップ時など）
+
+jobs:
+  update-margin:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Fetch and update margin data
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          GOOGLE_SHEETS_CREDS: ${{ secrets.GOOGLE_SHEETS_CREDS }}
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+        run: python src/shinyo_fetcher.py
