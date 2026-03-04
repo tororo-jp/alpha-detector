@@ -1,95 +1,67 @@
-# 🔥 Alpha-Detector
+# 🔍 Alpha-Detector
 
-> **決算サプライズ検知システム** — 中小型株の「異常な好決算」をリアルタイムで自動検知・通知する
+> **決算サプライズ検知システム** — 中小型株の「異常な好決算」をリアルタイムで自動検知・Discord通知する
 
-[![GitHub Actions](https://img.shields.io/badge/GitHub_Actions-対応-2088FF?logo=github-actions)](https://github.com/features/actions)
-[![Python](https://img.shields.io/badge/Python-3.11-3776AB?logo=python)](https://python.org)
-[![License](https://img.shields.io/badge/License-MIT-green)](LICENSE)
+**完全無料・J-Quants不要・TDnetスクレイピング方式**
 
 ---
 
 ## 📖 目次
 
-- [何をするシステムか](#-何をするシステムか)
-- [システム構成](#-システム構成)
-- [スコアリングロジック](#-スコアリングロジック)
-- [フィルター一覧](#-フィルター一覧)
-- [通知サンプル](#-通知サンプル)
-- [セットアップ手順](#-セットアップ手順)
-- [初期データ投入](#-初期データ投入)
-- [ファイル構成](#-ファイル構成)
-- [費用・制約](#-費用制約)
-- [トラブルシューティング](#-トラブルシューティング)
+1. [何をするシステムか](#-何をするシステムか)
+2. [システム構成](#-システム構成)
+3. [スコアリングロジック](#-スコアリングロジック)
+4. [フィルター一覧](#-フィルター一覧)
+5. [通知サンプル](#-通知サンプル)
+6. [セットアップ手順](#️-セットアップ手順)
+7. [初期データ投入](#-初期データ投入)
+8. [GitHubへの反映方法](#-githubへの反映方法)
+9. [ファイル構成](#-ファイル構成)
+10. [費用・制約](#-費用制約)
+11. [トラブルシューティング](#-トラブルシューティング)
 
 ---
 
 ## 🎯 何をするシステムか
 
-**Alpha-Detector** は、東証グロース・スタンダードの決算発表（15:00〜16:00）を自動監視し、  
-「期待値とのギャップが大きく、かつ需給が良好な銘柄」をDiscordに即時通知します。
-
-単なる増収増益ではなく、**季節性を考慮した進捗率の乖離**と**株価の織り込み度**を重視します。
-
 ```
-15:00 決算発表
-  ↓
-Alpha-Detectorが自動検知（5分以内）
-  ↓
-スコアリング（100点満点）
-  ↓
-80点以上 → Discordに「🔥 S評価」で即時通知
+① 毎営業日 15:00〜16:05 に GitHub Actions が自動起動（5分間隔）
+        ↓
+② TDnet（東証適時開示）をスクレイピングして決算発表を検知
+        ↓
+③ 発表企業のXBRL（決算短信データ）をダウンロードして財務数値を自動抽出
+        ↓
+④ 過去3年の同四半期実績と比較してスコアリング（100点満点）
+        ↓
+⑤ 80点以上（S評価）または60点以上（A評価）の銘柄をDiscordに即時通知
 ```
+
+対象: **東証グロース・スタンダード上場** / **時価総額1,000億円以下** の中小型株
 
 ---
 
 ## 🏗 システム構成
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│                    GitHub Actions                        │
-│                                                         │
-│  ┌──────────────────┐     ┌──────────────────────────┐  │
-│  │ market_hours.yml │     │   weekly_shinyo.yml      │  │
-│  │ 平日 15:00-16:05 │     │   毎週火曜 17:30          │  │
-│  │ 5分間隔で起動     │     │   JPX信用残PDF取得        │  │
-│  └────────┬─────────┘     └──────────────┬───────────┘  │
-│           │                              │               │
-└───────────┼──────────────────────────────┼───────────────┘
-            │                              │
-            ▼                              ▼
-┌───────────────────────┐    ┌─────────────────────────┐
-│   データ収集レイヤー    │    │    Google Sheets DB      │
-│                       │    │                         │
-│  tdnet_watcher.py     │    │  ┌─────────────────┐    │
-│  └ J-Quants API で    │    │  │ historyシート    │    │
-│    新規開示を取得      │    │  │ 過去3年 財務履歴  │    │
-│                       │    │  ├─────────────────┤    │
-│  xbrl_parser.py       │    │  │ marginシート     │    │
-│  └ XBRLから財務数値   │    │  │ 最新週次 信用残  │    │
-│    を抽出             │    │  ├─────────────────┤    │
-│                       │    │  │ processedシート  │    │
-│  price_analyzer.py    │    │  │ 処理済み開示ID  │    │
-│  └ yfinanceで株価・   │    │  └─────────────────┘    │
-│    対TOPIX乖離率取得  │    └─────────────────────────┘
-└───────────┬───────────┘
-            │
-            ▼
-┌───────────────────────┐
-│    解析レイヤー         │
-│                       │
-│  scoring_engine.py    │
-│  └ 100点満点スコアリング│
-│    フィルタリング       │
-└───────────┬───────────┘
-            │
-            ▼ 80点以上(S) / 60点以上(A)
-┌───────────────────────┐
-│    通知レイヤー         │
-│                       │
-│  notifier.py          │
-│  └ Discord Webhookへ  │
-│    即時通知            │
-└───────────────────────┘
+GitHub Actions（スケジューラー・無料）
+    │
+    ├─ TDnet適時開示 HTML ─────→ tdnet_watcher.py  ← 新規開示を検知
+    │  release.tdnet.info              │                （無料・リアルタイム）
+    │                                  ↓
+    ├─ TDnet XBRL ZIP ──────────→ xbrl_parser.py   ← 財務数値を抽出
+    │  （決算短信の構造化データ）        │                （JP GAAP/IFRS/US GAAP対応）
+    │                                  ↓
+    ├─ yfinance ────────────────→ price_analyzer.py ← 株価・対TOPIX取得
+    │                                  │
+    ├─ JPX公式PDF ──────────────→ shinyo_fetcher.py ← 信用残取得
+    │                                  │
+    │                                  ↓
+    ├─ Google Sheets ───────────→ history_db.py     ← 過去3年履歴DB
+    │  （財務履歴・信用残・処理済みID）  │
+    │                                  ↓
+    │                          scoring_engine.py    ← スコアリング
+    │                                  │
+    └─ Discord Webhook ─────────← notifier.py       ← S/A評価を通知
 ```
 
 ### 使用サービスと費用
@@ -97,14 +69,13 @@ Alpha-Detectorが自動検知（5分以内）
 | サービス | 用途 | 費用 |
 |---------|------|------|
 | **GitHub Actions** | スケジューラー・実行環境 | 無料（パブリックRepo） |
-| **J-Quants API（Freeプラン）** | 初期データ投入 | 無料 |
-| **J-Quants API（Lightプラン）** | リアルタイム検知（本番稼働） | 1,650円/月〜 |
+| **TDnet 適時開示** | リアルタイム開示検知・XBRL取得 | **無料**（公開HTML/ZIP） |
 | **yfinance** | 株価・出来高データ取得 | 無料 |
 | **Google Sheets** | 財務履歴・信用残DB | 無料 |
 | **JPX公式PDF** | 銘柄別信用取引週末残高 | 無料 |
 | **Discord Webhook** | 検知結果の通知 | 無料 |
 
-> **合計費用: 1,650円/月〜**（初期データ投入はFreeプランで無料）
+> **合計費用: 月0円** （J-Quants不要・すべて無料）
 
 ---
 
@@ -114,316 +85,274 @@ Alpha-Detectorが自動検知（5分以内）
 
 ### ① 季節性補正済み進捗スコア（最大40点）
 
-単純な進捗率ではなく、**過去3年の同時期との比較**で評価します。
-
 ```
-スコア = 40点 × (今回進捗率 − 過去3年平均進捗率) ÷ 10%
+進捗率乖離 = 今回の進捗率 − 過去3年の同Q平均進捗率
 
-例）今回 68%、過去3年平均 42% → 乖離 +26% → 満点（40点）
-例）今回 25%、過去3年平均 28% → 乖離 −3%  → 減点（0点以下は0）
+例: 今回2Q進捗率 55% / 過去3年平均 44% → 乖離 +11%
+  → 40点 × (11% / 10%) = 44点 → 上限40点
 ```
 
-> 過去3年分のデータが存在しない銘柄は**スコア算出なし（除外）**
+> **なぜ「過去3年平均との差」で見るのか？**
+> 季節性の強い業種（小売・観光など）は毎年同じ時期に進捗が高くなる。
+> 「今年の進捗率が高い」ではなく「例年より高い」かどうかが重要。
 
 ### ② モメンタム加速スコア（最大30点）
 
-直近の**単四半期**での収益性改善を評価します。  
-累計値からの逆算を避け、**前Q累計との差分**で誤差ゼロの計算を実装。
-
 ```
-スコア = 30点 × (当Q単Q営業利益率 − 前年同Q単Q営業利益率) ÷ 2pt
+単Q営業利益率改善 = 当Q単Q営業利益率 − 前年同Q単Q営業利益率
 
-例）今期2Q単Q利益率 15%、前年 10% → +5pt改善 → 満点（30点）
+例: 当2Q単Q利益率 8.5% / 前年2Q単Q 6.0% → 改善 +2.5pt
+  → 30点 × (2.5pt / 2.0pt) = 37.5点 → 上限30点
 ```
 
-| 状況 | 処理 |
-|------|------|
-| 前Qデータ欠損 | 0点（誤値を使わない） |
-| 1Qは累計=単Q | 逆算なしでそのまま計算 |
-| 営業赤字・ゼロ | 別途警告フラグを設定 |
+> 単Q = 累計から前Q累計を差し引いた「その四半期だけ」の値。
+> 累計では見えない「最新四半期の収益加速」を捉える。
 
 ### ③ 上方修正・増配フラグ（30点）
 
-| イベント | 点数 |
-|---------|------|
-| 通期予想の上方修正 | 30点 |
-| 増配発表 | 30点 |
-| 両方 | 30点（加算なし） |
-| なし | 0点 |
+```
+上方修正（業績予想の修正）または増配（配当予想の修正）があれば +30点
+```
+
+### スコア計算例
+
+| 項目 | 計算 | 得点 |
+|------|------|------|
+| 進捗率乖離 +11% | 40 × 11/10 → 上限 | 40点 |
+| 単Q利益率改善 +1.5pt | 30 × 1.5/2.0 | 22点 |
+| 上方修正あり | フラグ | 30点 |
+| **合計** | | **92点 → S評価** |
 
 ---
 
 ## 🚨 フィルター一覧
 
-スコアに関わらず、以下の条件に該当する場合は**警告を付与**します。
+スコアによらず、以下の条件に該当する場合は警告を通知に付与します。
 
 | フィルター | 条件 | 目的 |
 |-----------|------|------|
-| **過去履歴不足** | 過去3年の同Q実績データが3件未満 | 比較不能な銘柄を除外 |
-| **期待値織り込み** | 対TOPIX直近20日乖離率 > +15% | 材料出尽くしによる急落を回避 |
-| **利益の質（通常）** | 純利益 ÷ 営業利益 > 1.5 | 特別利益による一過性黒字を排除 |
-| **利益の質（ゼロ）** | 営業利益 = 0 | 収益性ゼロの警告 |
-| **利益の質（赤字）** | 営業利益 < 0 かつ 純利益 > 0 | 特益による見かけ上の黒字を警告 |
-| **需給悪化** | 信用倍率 > 10倍 | 戻り売り圧力の強い銘柄を排除 |
-| **保守的据え置き** | 進捗率 > 過去平均+15% かつ 修正なし | 通知に注記として表示（除外はしない） |
+| **期待値織り込み** | 直近20日で対TOPIX+15%超 | 既に株価に織り込まれた銘柄を除外 |
+| **利益の質** | 純利益÷営業利益 > 1.5 | 特別利益・資産売却による見かけ上の好決算を除外 |
+| **需給悪化** | 信用倍率 > 10倍 | 売り圧力が強い銘柄を警告 |
+| **営業赤字** | 営業利益 ≤ 0 | 収益性に問題がある銘柄を警告 |
+| **履歴不足** | 過去3年の同Q実績が3件未満 | 比較対象がない銘柄を除外（データ蓄積後に自動解除） |
 
 ---
 
 ## 📨 通知サンプル
 
 ```
-## 🔥 【88点：S評価】 [1234] サンプル株式会社
+🔥【92点:S評価】[1234] 〇〇テクノロジー株式会社
 
-### 📈 業績サマリー (2Q累計)
-- 営業利益進捗率: 68.0%（過去3年平均: 42.0% → +26.0%の乖離）
-- 単Q営業利益率: 15.0%（前年同期: 10.0%, 変化: +5.0pt）
-- イベント: 上方修正あり ✅
+### 📈 業績サマリー（2Q累計）
+- 進捗率: **55.0%**（過去3年平均:44.0%  乖離:**+11.0%**）
+- 単Q営業利益率: 8.5%（前年同期:6.0%  変化:+2.5pt）
+- イベント: 上方修正 ✅
 
 ### ⚠️ 需給・織り込みチェック
-- 株価: 終値 1,250円 / 直近20日対TOPIX +2.1%
-- 信用残: 信用倍率 1.2倍（買い残 50,000株 / 売り残 41,000株）
+- 株価: 1,250円  直近20日対TOPIX:+3.2%
+- 信用残: 信用倍率2.1倍（買:120,000株 / 売:57,000株）
 
-### 🔍 フィルター結果
+### 🔍 フィルター
 なし
 
-### 📊 スコア内訳（88/100点）
-進捗スコア: 40/40 | モメンタム: 18/30 | 修正/増配: 30/30
+### 📊 スコア内訳（92/100点）
+進捗:40/40  モメンタム:22/30  修正/増配:30/30
 ```
 
 ---
 
 ## ⚙️ セットアップ手順
 
-### 事前準備（アカウント作成）
+### 必要なもの
 
-以下のサービスに登録してください（すべて無料）。
-
-- [ ] [GitHub](https://github.com) — リポジトリ・Actions
-- [ ] [Google Cloud](https://console.cloud.google.com) — Sheets API
-- [ ] [Discord](https://discord.com) — 通知先
-- [ ] [J-Quants](https://jpx-jquants.com) — 適時開示データ
+- [ ] GitHubアカウント
+- [ ] Googleアカウント（Google Sheetsに使用）
+- [ ] Discordサーバー（通知受け取り用）
 
 ---
 
 ### Step 1: Google Sheets APIのセットアップ
 
-**1-1. Google Cloudでサービスアカウントを作成**
+#### 1-1. GCPプロジェクトの作成
 
-1. [Google Cloud Console](https://console.cloud.google.com) でプロジェクトを新規作成
-2. 「APIとサービス」→「ライブラリ」から以下を有効化
-   - `Google Sheets API`
-   - `Google Drive API`
-3. 「APIとサービス」→「認証情報」→「サービスアカウントを作成」
-4. 作成後、「キー」タブ→「鍵を追加」→「JSONキーをダウンロード」
+1. [Google Cloud Console](https://console.cloud.google.com/) にアクセス
+2. 「プロジェクトを作成」→ プロジェクト名: `alpha-detector`
+3. 作成したプロジェクトを選択
 
-**1-2. Google Sheetsを作成**
+#### 1-2. APIの有効化
+
+1. 左メニュー「APIとサービス」→「ライブラリ」
+2. 「Google Sheets API」を検索 → 有効化
+3. 「Google Drive API」を検索 → 有効化
+
+#### 1-3. サービスアカウントの作成
+
+1. 「APIとサービス」→「認証情報」→「認証情報を作成」→「サービスアカウント」
+2. サービスアカウント名: `alpha-detector-sa` → 作成
+3. 作成されたサービスアカウントをクリック → 「キー」タブ
+4. 「鍵を追加」→「新しい鍵を作成」→「JSON」→ ダウンロード
+5. ダウンロードした `service-account-key.json` を安全な場所に保存
+
+#### 1-4. Google Sheetsの作成とシート初期化
 
 1. [Google Sheets](https://sheets.google.com) で新規スプレッドシートを作成
-2. URLの `/d/` の後ろのIDをコピー
+2. スプレッドシートのURLから `GOOGLE_SHEET_ID` をコピー
    ```
-   https://docs.google.com/spreadsheets/d/【ここがGOOGLE_SHEET_ID】/edit
+   https://docs.google.com/spreadsheets/d/【ここがSHEET_ID】/edit
    ```
-3. 「共有」からサービスアカウントのメールアドレスを**編集者**として追加
+3. スプレッドシートの「共有」ボタン → JSONキー内の `client_email` を追加（編集者権限）
 
-**1-3. シートの初期化**
+> **`client_email` の確認方法**
+> JSONキーファイルを開いて `"client_email"` フィールドの値をコピーしてください。
+> 例: `alpha-detector-sa@your-project-id.iam.gserviceaccount.com`
 
-```bash
-pip install gspread google-auth
+4. PowerShellでシートを初期化:
 
-GOOGLE_SHEETS_CREDS='<JSONキーの内容を1行に圧縮>' \
-GOOGLE_SHEET_ID='<シートID>' \
+```powershell
+$env:GOOGLE_SHEETS_CREDS = Get-Content "C:\path\to\service-account-key.json" -Raw `
+  | ForEach-Object { $_ -replace "`r`n|`n", "" }
+$env:GOOGLE_SHEET_ID = "your-sheet-id-here"
+
 python scripts/setup_sheets.py
 ```
 
-`history` / `margin` / `processed` の3シートが自動作成されます。
+---
+
+### Step 2: Discord Webhookの作成
+
+1. Discordサーバーの通知を受け取りたいチャンネルを右クリック
+2. 「チャンネルを編集」→「連携サービス」→「ウェブフック」→「新しいウェブフック」
+3. 作成したWebhookの「ウェブフックURLをコピー」
 
 ---
 
-### Step 2: J-QuantsのAPIキー取得
+### Step 3: GitHubリポジトリの作成
 
-J-Quantsのメニューの「設定 → APIキー」からAPIキーを発行・取得してください。このキーはリクエストの認証に使用します。
-
-1. [J-Quants](https://jpx-jquants.com) に無料登録・プラン選択
-2. ダッシュボードの「設定 → APIキー」からAPIキーを発行
-3. 発行されたAPIキーをコピー（後でGitHub Secretsに登録）
-
-> **注意:** 2025年12月22日以降にご登録の方はV2 APIのみのご利用となるため、ダッシュボードからAPIキーを発行してください。
+1. [GitHub](https://github.com) で新規リポジトリを作成（名前: `alpha-detector`）
+2. Publicに設定（GitHub Actionsを無料で使うため）
 
 ---
 
-### Step 3: Discord Webhookの作成
+### Step 4: GitHub Secretsの登録
 
-1. 通知を受け取りたいチャンネルを開く
-2. 「チャンネルの編集」→「連携サービス」→「ウェブフック」→「ウェブフックを作成」
-3. Webhook URLをコピー
-
----
-
-### Step 4: GitHubリポジトリのセットアップ
-
-**4-1. リポジトリを作成**
-
-```bash
-git clone https://github.com/<your-name>/alpha-detector.git
-cd alpha-detector
-# このプロジェクトのファイルをすべてコピーしてpush
-git add .
-git commit -m "initial commit"
-git push
-```
-
-> ⚠️ **パブリックリポジトリを推奨**（Actions無制限。シークレットは暗号化されるので漏洩の心配なし）
-
-**4-2. GitHub Secretsに4つの値を登録**
-
-「Settings」→「Secrets and variables」→「Actions」→「New repository secret」
+リポジトリの「Settings」→「Secrets and variables」→「Actions」→「New repository secret」
 
 | Secret名 | 値 |
 |---------|---|
 | `DISCORD_WEBHOOK_URL` | DiscordのWebhook URL |
-| `GOOGLE_SHEETS_CREDS` | GCPサービスアカウントのJSONキー（**1行に圧縮**） |
+| `GOOGLE_SHEETS_CREDS` | JSONキーの**1行圧縮版**（下記参照） |
 | `GOOGLE_SHEET_ID` | スプレッドシートのID |
-| `JQUANTS_API_KEY` | J-Quantsダッシュボードで発行したAPIキー |
 
-JSONキーを1行に圧縮するコマンド:
-```bash
-cat service-account-key.json | tr -d '\n'
+#### JSONキーを1行に圧縮する方法（PowerShell）
+
+```powershell
+# service-account-key.jsonのパスを指定してクリップボードにコピー
+(Get-Content "C:\path\to\service-account-key.json" -Raw) `
+  -replace "`r`n|`n", "" | Set-Clipboard
+
+# クリップボードの内容をGitHub Secretsに貼り付け
 ```
 
 ---
 
 ### Step 5: 動作確認
 
-1. 「Actions」タブを開く
-2. 「Alpha-Detector (Market Hours)」→「Run workflow」で手動実行
-3. ログに `新規開示なし → 終了` または通知が出ることを確認
+コードをGitHubにプッシュした後（[GitHubへの反映方法](#-githubへの反映方法)を参照）:
+
+1. GitHubリポジトリ → 「Actions」タブ
+2. 左サイドバー「Alpha-Detector (Market Hours)」を選択
+3. 「Run workflow」ボタン → 「Run workflow」をクリック
+4. 実行中の行をクリック → 「detect」ジョブ → 「Run Alpha-Detector」ステップを展開
+
+**正常時のログ**
+```
+2026-03-05 06:05:01 INFO === Alpha-Detector 起動 (TDnetスクレイピング方式) ===
+2026-03-05 06:05:01 INFO 処理済みID: 0件
+2026-03-05 06:05:03 INFO TDnet取得完了: 0件の新規対象開示
+2026-03-05 06:05:03 INFO 新規開示なし → 終了
+```
+
+> 平日の15:00〜16:05以外に手動実行した場合は「新規開示なし → 終了」が正常です。
 
 ---
 
 ## 📥 初期データ投入
 
-過去3年分の財務履歴がないと全銘柄がスキップされます。  
-**初期データ投入はFreeプランで無料**で行えます。
+過去3年分の財務履歴がないと全銘柄がスキップされます。
+**J-Quants不要・完全無料**でTDnetから過去5年分を取得できます。
 
-### J-QuantsのプランとFreeプランの制約
-
-| 用途 | エンドポイント | 必要プラン |
-|------|--------------|-----------|
-| **初期データ投入**（過去データ一括取得） | `/fins/summary`（日付指定） | **Freeプラン（無料）** |
-| **リアルタイム検知**（本番稼働） | `/fins/summary`（当日分） | **Lightプラン以上**（1,650円/月〜） |
-
-> ⚠️ **Freeプランはデータが12週間（約3ヶ月）遅延します。**  
-> そのため過去データの取得には使えますが、当日の決算発表をリアルタイムで検知するにはLightプラン以上が必要です。
-
-### 取得方式の仕組み
-
-旧方式（銘柄コード指定）ではLightプランが必要でしたが、  
-新方式（**日付ループ**）ではFreeプランで取得できます。
+### 仕組み
 
 ```
-1日分のリクエスト → その日に開示された全銘柄をまとめて取得
-3年分 ≒ 750営業日分のリクエスト → 処理時間 約15〜20分
+TDnet 銘柄別 JSON
+https://www.release.tdnet.info/inbs/I_list_00.json?Sccode={code}
+  → 過去5年分の開示一覧（XBRL ZIP URLを含む）
+  → リアルタイム検知と全く同じXBRLパース処理を使用
+  → Google Sheetsのhistoryシートに自動投入
 ```
 
 ### 実行手順（PowerShell）
 
-**① まず直近7日間でテスト（Sheetsへの書き込みなし）**
+#### ① 事前準備
 
 ```powershell
-$env:JQUANTS_API_KEY = "your-api-key"
-python scripts/test_single_import.py --days 7
+# 依存ライブラリのインストール
+pip install requests beautifulsoup4 lxml gspread google-auth yfinance pandas openpyxl
+```
+
+#### ② JSONキーを1行に圧縮してクリップボードにコピー
+
+```powershell
+(Get-Content "C:\path\to\service-account-key.json" -Raw) `
+  -replace "`r`n|`n", "" | Set-Clipboard
+```
+
+#### ③ 1銘柄でテスト（Sheetsへの書き込みなし）
+
+```powershell
+python scripts/test_single_import.py --code 7203
 ```
 
 正常なら以下のように表示されます:
-
 ```
-直近7日間（5営業日）のデータを確認中...
+[7203] TDnetから開示一覧を取得中...
+8件の対象開示を発見
 
-【2026-02-28】12件取得 → 8件変換
-  コード   年度     Q     売上(万円)   営業利益(万円)  進捗率
-  -------------------------------------------------------
-  1234   2025   2Q      120,000          8,000    48.0%
-  5678   2025   3Q      250,000         18,000    72.0%
-  ...
+直近3件のXBRLをパースします...
+
+==================================================
+タイトル  : 2024年3月期第2四半期決算短信〔日本基準〕（連結）
+決算期末  : 2024-03-31
+四半期    : 2Q
+売上高    : 2,800,000万円
+営業利益  :   250,000万円
+純利益    :   180,000万円
+通期予想  :   520,000万円（進捗48.1%）
+==================================================
 ```
 
-**② 全件投入（デフォルト：過去3年分 / 約15〜20分）**
+#### ④ 全件投入（全銘柄・約2〜4時間）
 
 ```powershell
-$env:JQUANTS_API_KEY    = "your-api-key"
 $env:GOOGLE_SHEET_ID    = "your-sheet-id"
-$env:GOOGLE_SHEETS_CREDS = Get-Clipboard   # JSONキーをコピー済みの場合
+$env:GOOGLE_SHEETS_CREDS = Get-Clipboard
 
 python scripts/bulk_import_history.py
 ```
 
 **中断後の再開**（そのままもう一度実行するだけ）
-
 ```powershell
 python scripts/bulk_import_history.py
 ```
 
 **最初からやり直す場合のみ**
-
 ```powershell
 python scripts/bulk_import_history.py --reset-checkpoint
 ```
 
----
-
-## 📁 ファイル構成
-
-```
-alpha-detector/
-│
-├── .github/workflows/
-│   ├── market_hours.yml        # 平日 15:00〜16:05 / 5分間隔
-│   └── weekly_shinyo.yml       # 毎週火曜 17:30
-│
-├── src/
-│   ├── main.py                 # エントリーポイント（全体制御）
-│   ├── tdnet_watcher.py        # TDnet新規開示の取得
-│   ├── xbrl_parser.py          # XBRLから財務数値を抽出
-│   ├── scoring_engine.py       # スコアリング・フィルタリング
-│   ├── price_analyzer.py       # 株価取得（yfinance・sleep制御）
-│   ├── history_db.py           # Google Sheets読み書き
-│   ├── shinyo_fetcher.py       # JPX信用残PDF取得・解析
-│   └── notifier.py             # Discord通知
-│
-├── scripts/
-│   ├── setup_sheets.py         # 初回セットアップ（シート作成）
-│   ├── bulk_import_history.py  # 過去財務データ一括投入
-│   └── test_single_import.py   # 1銘柄テスト取得
-│
-├── data/
-│   └── processed_ids.json      # 処理済み開示IDキャッシュ
-│
-└── requirements.txt
-```
-
----
-
-## 💰 費用・制約
-
-### GitHub Actionsの使用分数
-
-| リポジトリ種別 | 月間上限 |
-|-------------|--------|
-| **パブリック** | **無制限** ← 推奨 |
-| プライベート | 2,000分/月 |
-
-決算シーズン（1月・4月・7月・10月）に5分×13回×20営業日 = 月1,300分程度使用します。
-
-### yfinanceの注意点
-
-- **非公式API** のため、仕様変更で突然取得できなくなるリスクがあります
-- Botブロック対策として銘柄間に **2〜3秒のsleep** を設定しています
-- 429エラー時は **30秒待機してリトライ**（最大3回）します
-
-### 信用残データの遅延
-
-- JPX信用残は **週次（金曜申込分・翌火曜16:30公開）** のため、当日の値はリアルタイムでは反映されません
-- 発表当日の信用倍率は直近金曜時点の値で代用します
+> ⏱ **処理時間**: 全銘柄（約3,000社）× 銘柄間2秒sleep → 約2〜4時間
+> 途中で中断しても `data/bulk_import_checkpoint.json` に進捗が保存されます。
 
 ---
 
@@ -435,14 +364,13 @@ alpha-detector/
 # 1. Gitが入っているか確認
 git --version
 
-# 2. プロジェクトフォルダに移動
+# 2. プロジェクトフォルダに移動（alpha-detectorフォルダの中）
 cd alpha-detector
 
 # 3. Gitを初期化
 git init
 
 # 4. GitHubのリポジトリをリモートに登録
-#    （GitHubで先にリポジトリを作成しておく）
 git remote add origin https://github.com/<あなたのユーザー名>/alpha-detector.git
 
 # 5. 全ファイルをステージング
@@ -451,21 +379,23 @@ git add .
 # 6. コミット
 git commit -m "initial commit"
 
-# 7. プッシュ
+# 7. GitHubにプッシュ
 git push -u origin main
 ```
+
+> ⚠️ `git push` で認証が求められた場合は、GitHubの「Settings → Developer settings → Personal access tokens」でトークンを発行して使用してください。
 
 ### ファイルを修正した後の反映
 
 ```powershell
-# 変更されたファイルを確認
+# 変更内容を確認
 git status
 
 # 全変更をステージング
 git add .
 
-# コミット（変更内容を簡潔に書く）
-git commit -m "bulk_import_history.py: 日付ループ方式に変更"
+# コミット（変更内容を日本語で書いてもOK）
+git commit -m "TDnetスクレイピング方式に変更"
 
 # GitHubに反映
 git push
@@ -478,53 +408,98 @@ git push
 | `git status` | 変更されたファイルの一覧を確認 |
 | `git add .` | 全変更をステージング |
 | `git add src/main.py` | 特定ファイルだけをステージング |
-| `git commit -m "メッセージ"` | コミット（変更を記録） |
+| `git commit -m "メッセージ"` | 変更を記録 |
 | `git push` | GitHubに反映 |
 | `git pull` | GitHubから最新を取得 |
 | `git log --oneline` | コミット履歴を確認 |
 
-### GitHubにプッシュするとActionsが動かない場合
+### 手動でActionsを動かす方法
 
-コードのプッシュでActionsは自動起動しません。  
-Actionsはスケジュール（cron）または手動実行で動作します。
-
-手動で動作確認する場合:
-1. GitHubのリポジトリページを開く
-2. 「Actions」タブをクリック
-3. 「Alpha-Detector (Market Hours)」を選択
-4. 「Run workflow」をクリック
+```
+GitHubリポジトリ
+  → 「Actions」タブ
+  → 左サイドバー「Alpha-Detector (Market Hours)」
+  → 「Run workflow」ボタン
+  → 「Run workflow」をクリック
+```
 
 ---
+
+## 📁 ファイル構成
+
+```
+alpha-detector/
+│
+├── .github/workflows/
+│   ├── market_hours.yml        # 平日 15:00〜16:05 / 5分間隔
+│   └── weekly_shinyo.yml       # 毎週火曜 17:30（信用残更新）
+│
+├── src/
+│   ├── main.py                 # エントリーポイント
+│   ├── tdnet_watcher.py        # TDnet HTMLスクレイピング（開示検知）
+│   ├── xbrl_parser.py          # XBRL ZIP解析（財務数値抽出）
+│   ├── history_db.py           # Google Sheets 財務履歴DB
+│   ├── scoring_engine.py       # スコアリング・フィルタリング
+│   ├── price_analyzer.py       # 株価・対TOPIX取得（yfinance）
+│   ├── shinyo_fetcher.py       # 信用残取得（JPX PDF）
+│   └── notifier.py             # Discord通知
+│
+├── scripts/
+│   ├── bulk_import_history.py  # 過去データ一括投入（TDnet方式）
+│   ├── test_single_import.py   # 1銘柄テスト確認
+│   └── setup_sheets.py         # Sheetsシート初期化
+│
+├── data/                       # ローカル一時ファイル（Git管理外）
+│   ├── processed_ids.json      # 処理済み開示IDキャッシュ
+│   └── bulk_import_checkpoint.json  # 一括投入の進捗
+│
+├── requirements.txt
+└── README.md
+```
+
+---
+
+## 💰 費用・制約
+
+### GitHub Actions の使用時間
+
+| 対象 | 頻度 | 1回の時間 | 月間合計 |
+|------|------|-----------|---------|
+| market_hours.yml | 平日 約26回/日 × 20日 | 約1〜2分 | 約520〜1,040分 |
+| weekly_shinyo.yml | 毎週火曜 1回 | 約2〜3分 | 約8〜12分 |
+
+> GitHub Actions の無料枠は **2,000分/月**。上記の使用量は余裕を持って収まります。
+
+### TDnetスクレイピングに関する注意
+
+- TDnetに明示的なスクレイピング禁止規定はありませんが、過剰なアクセスは避けています
+- 本システムは5分に1回・1〜3リクエスト程度のアクセスのみで、サーバーへの負荷は最小限です
+- XBRL構造はJPXが更新する場合があります。パースエラーが増えた場合は `xbrl_parser.py` の更新が必要になることがあります
+
+### その他
+
+- JPX信用残は**週次（金曜締め・翌火曜16:30公開）**のため当日分はリアルタイムでは反映されません
+- 過去3年の履歴データが揃っていない銘柄はスキップされます（初期投入後に自動解除）
+
+---
+
 ## 🛠 トラブルシューティング
 
 | 症状 | 原因 | 対処 |
 |------|------|------|
-| 新規開示が検知されない | J-Quants APIキー期限切れ・無効 | ダッシュボードでAPIキーを再発行しSecretを更新 |
-| 全銘柄がSKIPになる | historyシートの過去データ不足 | `bulk_import_history.py` を実行 |
-| 株価が取得できない | yfinanceのレート制限 | 数時間後に再実行。継続する場合はyfinanceのバージョンアップを確認 |
-| 信用残が更新されない | JPX PDFのURL・レイアウト変更 | JPX公式サイトを確認し `shinyo_fetcher.py` を修正 |
-| Discord通知が届かない | Webhook URLが誤り | Discord側でWebhookを再作成しSecretを更新 |
-| Actionsが起動しない | cronのタイムゾーン設定ミス | YMLのUTC時刻を確認（JST−9時間） |
-
----
-
-## 📈 稼働後の自動蓄積フロー
-
-```
-決算発表
-  ↓
-Alpha-Detector が検知・通知
-  ↓
-history_db.save_history() で今回の数値をGoogle Sheetsに自動保存
-  ↓（1年後）
-来年の同Q決算時に「過去3年」として活用される
-```
-
-初回投入時に2年分しかなくても、**1〜2決算サイクル後には自動的に3年分が揃います**。
+| 全銘柄がSKIPになる | historyシートの過去データ不足 | `scripts/bulk_import_history.py` を実行 |
+| 「XBRLパース失敗」が多い | TDnetのXBRL構造変更の可能性 | `xbrl_parser.py` のタグ名を確認・更新 |
+| Actionsが失敗する（赤×） | 環境変数（Secrets）の設定ミス | GitHub Secrets を再確認 |
+| Google Sheetsに書き込めない | サービスアカウントの共有設定漏れ | スプレッドシートの共有にclient_emailを追加 |
+| `git push` で認証エラー | GitHubの認証設定 | Personal Access Token を発行して使用 |
+| 「新規開示なし → 終了」が続く | 平日15:00〜16:05以外に実行している | スケジュール通り動作しているので正常 |
+| test_single_import.py でデータなし | 対象銘柄のXBRL未提供 or 銘柄コードの誤り | 別の銘柄コードで試す（例: 6758, 9984） |
 
 ---
 
 ## ⚠️ 免責事項
 
-本ツールは情報提供を目的としており、投資勧誘や売買の推奨を行うものではありません。  
-投資判断はご自身の責任のもとで行ってください。
+本システムはあくまでも情報収集・スクリーニングのツールです。
+投資判断は必ずご自身の責任でお願いします。
+本システムの利用によって生じた損失について、開発者は一切の責任を負いません。
+

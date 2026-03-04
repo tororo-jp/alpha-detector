@@ -1,84 +1,59 @@
 """
 scripts/test_single_import.py
 ==============================
-bulk_import_history.py を実行する前に、
-直近7日間のデータで動作確認するスクリプト。
+1銘柄分の動作確認スクリプト。
 Sheetsへの書き込みは行わない。
 
 【使い方（PowerShell）】
-  $env:JQUANTS_API_KEY = "your-api-key"
-  python scripts/test_single_import.py
-
-  # 取得日数を変更する場合
-  python scripts/test_single_import.py --days 14
+  python scripts/test_single_import.py --code 7203
 """
-
 import argparse
-import os
 import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent))
+from bulk_import_history import fetch_xbrl_urls_for_code
+sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
+from xbrl_parser import parse_disclosure
 import time
-from datetime import date, timedelta
-
-sys.path.insert(0, "scripts")
-from bulk_import_history import (
-    _business_days,
-    fetch_summary_by_date,
-    summaries_to_history_rows,
-    MARKET_CODES,
-    SLEEP_BETWEEN_REQUESTS,
-)
-
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--days", type=int, default=7, help="確認する日数（デフォルト: 7日）")
-    parser.add_argument(
-        "--market", choices=["growth", "standard", "both"], default="both"
-    )
+    parser.add_argument("--code", required=True, help="証券コード（例: 7203）")
     args = parser.parse_args()
 
-    if not os.environ.get("JQUANTS_API_KEY"):
-        print("❌ JQUANTS_API_KEY を環境変数に設定してください")
-        sys.exit(1)
+    print(f"\n[{args.code}] TDnetから開示一覧を取得中...")
+    docs = fetch_xbrl_urls_for_code(args.code)
 
-    end_date   = date.today()
-    start_date = end_date - timedelta(days=args.days)
-    days       = _business_days(start_date, end_date)
-    target_codes = MARKET_CODES[args.market]
+    if not docs:
+        print("開示データが見つかりませんでした。")
+        return
 
-    print(f"直近{args.days}日間（{len(days)}営業日）のデータを確認中...\n")
+    print(f"{len(docs)}件の対象開示を発見:\n")
+    for i, d in enumerate(docs):
+        print(f"  {i+1}. {d['title']}")
 
-    total_records = 0
-    total_rows    = 0
-
-    for target_date in days:
-        records = fetch_summary_by_date(target_date)
-        rows    = summaries_to_history_rows(records, target_codes)
-        total_records += len(records)
-        total_rows    += len(rows)
-
-        if rows:
-            print(f"【{target_date}】{len(records)}件取得 → {len(rows)}件変換")
-            print(f"  {'コード':<6} {'年度':<6} {'Q':<3} {'売上(万円)':>12} {'営業利益(万円)':>14} {'進捗率':>7}")
-            print(f"  {'-'*55}")
-            for r in rows[:5]:  # 最大5件だけ表示
-                print(
-                    f"  {r['code']:<6} {r['fiscal_year']:<6} {r['quarter']}Q  "
-                    f"{r['cumulative_sales']:>12,.0f} "
-                    f"{r['cumulative_op']:>14,.0f} "
-                    f"{r['progress_rate']:>6.1f}%"
-                )
-            if len(rows) > 5:
-                print(f"  ... 他{len(rows)-5}件")
+    print(f"\n直近3件のXBRLをパースします...\n")
+    for doc in docs[:3]:
+        summary = parse_disclosure(doc)
+        if summary:
+            print(f"{'='*50}")
+            print(f"タイトル  : {doc['title']}")
+            print(f"決算期末  : {summary.fiscal_year_end}")
+            print(f"四半期    : {summary.quarter}Q")
+            print(f"売上高    : {summary.net_sales:,.0f}万円")
+            print(f"営業利益  : {summary.operating_profit:,.0f}万円")
+            print(f"純利益    : {summary.net_income:,.0f}万円")
+            if summary.forecast_op:
+                progress = round(summary.operating_profit / summary.forecast_op * 100, 1)
+                print(f"通期予想  : {summary.forecast_op:,.0f}万円（進捗{progress}%）")
+            print(f"{'='*50}\n")
         else:
-            print(f"【{target_date}】データなし（休場日等）")
+            print(f"  ⚠️ {doc['title']} → パース失敗")
+        time.sleep(1.5)
 
-        time.sleep(SLEEP_BETWEEN_REQUESTS)
-
-    print(f"\n合計: {total_records}件取得 → {total_rows}件がhistoryシートに投入されます")
-    print("\n問題なければ以下を実行してください:")
+    print("問題なければ以下を実行してください:")
     print("  python scripts/bulk_import_history.py")
-
 
 if __name__ == "__main__":
     main()

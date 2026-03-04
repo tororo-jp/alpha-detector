@@ -1,30 +1,23 @@
 """
 scripts/bulk_import_history.py
 ==============================
-J-Quants API V2（Freeプラン）を使って過去の財務データを一括取得し、
+TDnet の銘柄別JSON（非公式・安定稼働）を使って
+過去5年分の決算短信XBRLを一括取得し、
 Google Sheetsのhistoryシートに投入するスクリプト。
 
-【Freeプランの制約と対応】
-  - /fins/statements（銘柄コード指定）→ Lightプラン以上が必要 → 使用しない
-  - /fins/summary（日付指定）         → Freeプランで利用可能  → これを使用
-  - Freeプランのデータは12週間遅延で配信されます
-    ※ 過去データの初期投入には問題なし
-    ※ リアルタイム検知にはLightプラン以上が必要（本番稼働時）
-
-【取得方式】
-  「日付を1日ずつループして /fins/summary を叩く」方式。
-  1リクエストで「その日に開示された全銘柄分」が取れるため、
-  リクエスト数は日数分（デフォルト3年 ≒ 750回）。
+【データ取得元】
+  https://www.release.tdnet.info/inbs/I_list_00.json?Sccode={code}&Sort=1
+  ・銘柄コード指定で過去5年分の開示一覧がJSONで返る
+  ・J-Quants不要・完全無料・リアルタイム検知と同一のXBRLパース処理を使用
 
 【使い方（PowerShell）】
-  $env:JQUANTS_API_KEY    = "your-api-key"
   $env:GOOGLE_SHEET_ID    = "your-sheet-id"
-  $env:GOOGLE_SHEETS_CREDS = Get-Clipboard
+  $env:GOOGLE_SHEETS_CREDS = Get-Clipboard   # JSONキーをコピー済みの場合
 
-  # 動作確認（直近7日間のみ）
-  python scripts/bulk_import_history.py --days 7
+  # 動作確認（1銘柄のみ）
+  python scripts/bulk_import_history.py --test-code 7203
 
-  # 全件投入（デフォルト：過去3年分）
+  # 全件投入（デフォルト：東証グロース+スタンダード）
   python scripts/bulk_import_history.py
 
   # 中断後の再開（そのまま再実行するだけ）
@@ -34,43 +27,47 @@ Google Sheetsのhistoryシートに投入するスクリプト。
   python scripts/bulk_import_history.py --reset-checkpoint
 
 【処理時間の目安】
-  3年分（約750営業日）× 1秒/リクエスト ≒ 約15〜20分
+  対象銘柄（グロース+スタンダード）約3,000社 × 各社の決算件数
+  銘柄間: 2秒sleep → 約2〜4時間
+  ※ 時間がかかるため週末夜など空き時間に実行推奨
+  ※ 途中中断→再開に対応（checkpointに処理済み銘柄を保存）
 """
 
-import argparse
 import json
 import logging
 import os
 import sys
 import time
-from datetime import datetime, timedelta, date
+import random
+from datetime import datetime
 from pathlib import Path
 
 import requests
 import gspread
 from google.oauth2.service_account import Credentials
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
-)
+# srcディレクトリをパスに追加してxbrl_parserを使い回す
+sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
+from xbrl_parser import parse_disclosure, FinancialSummary
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
-# ── 定数 ──────────────────────────────────────────────────
-JQUANTS_SUMMARY_URL = "https://api.jquants.com/v2/fins/summary"
+# ── 定数 ──────────────────────────────────────────────────────────────────
+TDNET_JSON_URL  = "https://www.release.tdnet.info/inbs/I_list_00.json?Sccode={code}&Sort=1"
+TDNET_LISTED_URL = "https://www.jpx.co.jp/markets/statistics-equities/misc/tvdivq0000001vg2-att/data_j.xls"
 
+# 対象市場コード（J-Quants市場コードと同じ仕様）
 MARKET_CODES = {
     "growth"  : {"0109"},
     "standard": {"0111"},
     "both"    : {"0109", "0111"},
 }
 
-SLEEP_BETWEEN_REQUESTS = 1.0
-SLEEP_ON_429           = 60.0
-MAX_RETRY              = 3
-DEFAULT_DAYS           = 365 * 3
-
-QUARTER_MAP = {"1Q": 1, "2Q": 2, "3Q": 3, "4Q": 4, "FY": 4}
+SLEEP_BETWEEN_CODES = 2.0   # 銘柄間のsleep（秒）
+SLEEP_BETWEEN_DOCS  = 1.5   # 同一銘柄内の文書間sleep（秒）
+SLEEP_ON_429        = 60.0
+MAX_RETRY           = 3
 
 CHECKPOINT_FILE = Path("data/bulk_import_checkpoint.json")
 
@@ -79,13 +76,11 @@ SCOPES = [
     "https://www.googleapis.com/auth/drive",
 ]
 
+# 決算短信キーワード（業績修正・配当修正も含める）
+TARGET_KEYWORDS = ["決算短信", "業績予想の修正", "配当予想の修正"]
 
-def _auth_headers() -> dict:
-    api_key = os.environ.get("JQUANTS_API_KEY", "")
-    if not api_key:
-        raise EnvironmentError("JQUANTS_API_KEY が設定されていません")
-    return {"x-api-key": api_key}
 
+# ── 認証 ──────────────────────────────────────────────────────────────────
 
 def get_sheets_client() -> gspread.Client:
     creds_dict = json.loads(os.environ["GOOGLE_SHEETS_CREDS"])
@@ -93,144 +88,113 @@ def get_sheets_client() -> gspread.Client:
     return gspread.authorize(creds)
 
 
-def _business_days(start: date, end: date) -> list[date]:
-    """start〜end間の営業日（月〜金）を新しい日から順に返す"""
-    days = []
-    d = end
-    while d >= start:
-        if d.weekday() < 5:
-            days.append(d)
-        d -= timedelta(days=1)
-    return days
+# ── 銘柄一覧取得（JPX上場銘柄CSV）────────────────────────────────────────
 
+def fetch_listed_codes(market: str) -> list[dict]:
+    """
+    JPX公式の上場銘柄一覧（xls）から対象市場の銘柄コードを取得する。
+    取得できない場合は空リストを返す。
+    """
+    target_codes = MARKET_CODES.get(market, MARKET_CODES["both"])
 
-def fetch_summary_by_date(target_date: date, retry: int = 0) -> list[dict]:
-    """指定日に開示された全銘柄の決算サマリーを取得する"""
-    date_str = target_date.strftime("%Y%m%d")
+    # JPXのCSV/XLSから取得を試みる
     try:
-        res = requests.get(
-            JQUANTS_SUMMARY_URL,
-            headers=_auth_headers(),
-            params={"date": date_str},
-            timeout=20,
-        )
+        import pandas as pd
+        logger.info("JPX上場銘柄一覧を取得中...")
+        df = pd.read_excel(TDNET_LISTED_URL, header=0)
+        # 列名を確認して市場区分で絞り込み
+        # 列名は「市場・商品区分」「コード」「銘柄名」など
+        code_col = [c for c in df.columns if "コード" in str(c)]
+        market_col = [c for c in df.columns if "市場" in str(c)]
+        if code_col and market_col:
+            filtered = df[df[market_col[0]].astype(str).str.contains("グロース|スタンダード", na=False)]
+            codes = [{"code": str(c).zfill(4)[:4]} for c in filtered[code_col[0]].dropna()]
+            logger.info(f"JPX一覧から{len(codes)}銘柄を取得")
+            return codes
+    except Exception as e:
+        logger.warning(f"JPX一覧取得失敗: {e}")
+
+    logger.warning("銘柄一覧の自動取得に失敗しました。--codes オプションで指定してください。")
+    return []
+
+
+# ── TDnet銘柄別JSON取得 ───────────────────────────────────────────────────
+
+def fetch_xbrl_urls_for_code(code: str, retry: int = 0) -> list[dict]:
+    """
+    TDnetの銘柄別JSON（非公式）から決算短信のXBRL URL一覧を取得する。
+
+    Returns:
+        [{"doc_id": str, "title": str, "xbrl_zip_url": str, "code": str}, ...]
+    """
+    url = TDNET_JSON_URL.format(code=code)
+    try:
+        res = requests.get(url, timeout=15)
         if res.status_code == 429:
             if retry < MAX_RETRY:
-                logger.warning(f"[{date_str}] 429 Rate limit. {SLEEP_ON_429}秒待機...")
+                logger.warning(f"[{code}] 429 Rate limit. {SLEEP_ON_429}秒待機...")
                 time.sleep(SLEEP_ON_429)
-                return fetch_summary_by_date(target_date, retry + 1)
-            logger.error(f"[{date_str}] リトライ上限到達 → スキップ")
+                return fetch_xbrl_urls_for_code(code, retry + 1)
             return []
         if res.status_code == 404:
             return []
         res.raise_for_status()
-        body = res.json()
-        return body.get("data") or body.get("statements", [])
-    except requests.RequestException as e:
-        logger.warning(f"[{date_str}] 取得失敗: {e}")
+        data = res.json()
+    except Exception as e:
+        logger.warning(f"[{code}] TDnet JSON取得失敗: {e}")
         return []
 
+    results = []
+    for item in data.get("list", []):
+        title     = item.get("title", "")
+        file_link = item.get("fileLink", "")
 
-def _to_man_yen(value) -> float | None:
-    if value is None or value == "":
-        return None
-    try:
-        return round(float(value) / 10000, 1)
-    except (ValueError, TypeError):
-        return None
-
-
-def _calc_progress_rate(cum_op: float | None, fy_op: float | None) -> float:
-    if cum_op is None or fy_op is None or fy_op == 0:
-        return 0.0
-    return round(cum_op / fy_op * 100, 1)
-
-
-def summaries_to_history_rows(
-    records: list[dict],
-    target_market_codes: set[str],
-) -> list[dict]:
-    """
-    /fins/summary のレスポンスリストを historyシート用の行形式に変換する。
-    対象市場・修正報告除外・欠損除外を行う。
-    """
-    rows = []
-    seen_keys: set[tuple] = set()
-
-    for s in records:
-        # 市場フィルタ
-        if str(s.get("MarketCode", "")) not in target_market_codes:
+        # 決算短信・修正のみ、訂正は除外
+        if not any(kw in title for kw in TARGET_KEYWORDS):
+            continue
+        if "訂正" in title:
+            continue
+        if not file_link or not file_link.endswith(".zip"):
             continue
 
-        # 修正報告書を除外
-        doc_type = s.get("TypeOfDocument", "")
-        if "Amendment" in doc_type or "Revision" in doc_type:
-            continue
+        doc_id = file_link.replace(".zip", "").replace(".ZIP", "")
+        # filelinkはパスのみの場合があるのでベースURLを付与
+        if not file_link.startswith("http"):
+            file_link = "https://www.release.tdnet.info/inbs/" + file_link
 
-        # 四半期コード
-        quarter = QUARTER_MAP.get(s.get("TypeOfCurrentPeriod", ""))
-        if quarter is None:
-            continue
-
-        # 銘柄コード
-        code = str(s.get("Code", ""))[:4]
-        if not code or not code.isdigit():
-            continue
-
-        # 会計年度
-        fy_str = s.get("CurrentFiscalYearEndDate", "") or s.get("FiscalYearEndDate", "")
-        if not fy_str or len(fy_str) < 4:
-            continue
-        try:
-            fiscal_year = int(fy_str[:4])
-        except ValueError:
-            continue
-
-        # 重複チェック
-        key = (code, fiscal_year, quarter)
-        if key in seen_keys:
-            continue
-        seen_keys.add(key)
-
-        # 財務数値（万円換算）
-        cum_sales = _to_man_yen(s.get("NetSales"))
-        cum_op    = _to_man_yen(s.get("OperatingProfit"))
-        cum_net   = _to_man_yen(s.get("Profit") or s.get("NetIncome"))
-        fy_op     = _to_man_yen(s.get("ForecastOperatingProfit"))
-
-        if cum_op is None or cum_sales is None:
-            continue
-
-        rows.append({
-            "code"            : code,
-            "fiscal_year"     : fiscal_year,
-            "quarter"         : quarter,
-            "cumulative_sales": cum_sales,
-            "cumulative_op"   : cum_op,
-            "cumulative_net"  : cum_net if cum_net is not None else 0.0,
-            "progress_rate"   : _calc_progress_rate(cum_op, fy_op),
+        results.append({
+            "doc_id"      : doc_id,
+            "title"       : title,
+            "xbrl_zip_url": file_link,
+            "code"        : code,
+            "company_name": item.get("company", ""),
         })
 
-    return rows
+    return results
 
 
-def save_rows_to_sheets(rows: list[dict], ws: gspread.Worksheet) -> None:
-    if not rows:
-        return
-    now = datetime.now().isoformat()
-    sheet_rows = [
-        [
-            r["code"], r["fiscal_year"], r["quarter"],
-            r["cumulative_sales"], r["cumulative_op"],
-            r["cumulative_net"], r["progress_rate"], now,
-        ]
-        for r in rows
-    ]
-    ws.append_rows(sheet_rows, value_input_option="RAW")
+# ── Google Sheets書き込み ─────────────────────────────────────────────────
 
+def save_summary_to_sheets(summary: FinancialSummary, ws: gspread.Worksheet) -> None:
+    """FinancialSummaryをhistoryシートに1行追記"""
+    fiscal_year = int(summary.fiscal_year_end[:4]) if summary.fiscal_year_end else 0
+    ws.append_rows([[
+        summary.code,
+        fiscal_year,
+        summary.quarter,
+        summary.net_sales,
+        summary.operating_profit,
+        summary.net_income,
+        round(summary.operating_profit / summary.forecast_op * 100, 1)
+            if summary.forecast_op else 0.0,
+        datetime.now().isoformat(),
+    ]], value_input_option="RAW")
+
+
+# ── チェックポイント管理 ──────────────────────────────────────────────────
 
 def load_checkpoint() -> set[str]:
-    """処理済み日付（YYYYMMDD）のセットを返す"""
+    """処理済み銘柄コードのセットを返す"""
     if CHECKPOINT_FILE.exists():
         try:
             with open(CHECKPOINT_FILE) as f:
@@ -240,30 +204,49 @@ def load_checkpoint() -> set[str]:
     return set()
 
 
-def save_checkpoint(done_dates: set[str]) -> None:
+def save_checkpoint(done_codes: set[str]) -> None:
     CHECKPOINT_FILE.parent.mkdir(parents=True, exist_ok=True)
     with open(CHECKPOINT_FILE, "w") as f:
-        json.dump(list(done_dates), f)
+        json.dump(list(done_codes), f)
 
+
+# ── メイン ────────────────────────────────────────────────────────────────
 
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Alpha-Detector 過去財務データ一括投入（日付ループ方式）"
-    )
-    parser.add_argument(
-        "--market", choices=["growth", "standard", "both"], default="both",
-    )
-    parser.add_argument(
-        "--days", type=int, default=DEFAULT_DAYS,
-        help=f"取得する過去日数（デフォルト: {DEFAULT_DAYS}日 ≒ 3年）",
-    )
-    parser.add_argument(
-        "--reset-checkpoint", action="store_true",
-        help="チェックポイントをリセットして最初から再実行",
-    )
+    import argparse
+    parser = argparse.ArgumentParser(description="Alpha-Detector 過去財務データ一括投入（TDnet方式）")
+    parser.add_argument("--market", choices=["growth", "standard", "both"], default="both")
+    parser.add_argument("--test-code", type=str, default="",
+                        help="動作確認用：指定した1銘柄だけ処理（Sheetsへの書き込みなし）")
+    parser.add_argument("--codes", type=str, default="",
+                        help="カンマ区切りで銘柄コードを直接指定（例: 1234,5678）")
+    parser.add_argument("--reset-checkpoint", action="store_true",
+                        help="チェックポイントをリセットして最初から再実行")
     args = parser.parse_args()
 
-    required_envs = ["JQUANTS_API_KEY", "GOOGLE_SHEETS_CREDS", "GOOGLE_SHEET_ID"]
+    # テストモード
+    if args.test_code:
+        logger.info(f"テストモード: {args.test_code}")
+        docs = fetch_xbrl_urls_for_code(args.test_code)
+        logger.info(f"{len(docs)}件の対象開示を発見")
+        for d in docs[:3]:  # 最大3件だけ確認
+            logger.info(f"  {d['title']} → {d['xbrl_zip_url']}")
+            summary = parse_disclosure(d)
+            if summary:
+                print(f"\n{'='*50}")
+                print(f"コード    : {summary.code}")
+                print(f"決算期末  : {summary.fiscal_year_end}")
+                print(f"四半期    : {summary.quarter}Q")
+                print(f"売上高    : {summary.net_sales:,.0f}万円")
+                print(f"営業利益  : {summary.operating_profit:,.0f}万円")
+                print(f"純利益    : {summary.net_income:,.0f}万円")
+                print(f"通期予想  : {summary.forecast_op}万円")
+                print(f"{'='*50}\n")
+            time.sleep(SLEEP_BETWEEN_DOCS)
+        return
+
+    # 通常モード
+    required_envs = ["GOOGLE_SHEETS_CREDS", "GOOGLE_SHEET_ID"]
     missing = [e for e in required_envs if not os.environ.get(e)]
     if missing:
         print(f"❌ 環境変数が不足しています: {', '.join(missing)}")
@@ -272,71 +255,68 @@ def main() -> None:
     if args.reset_checkpoint and CHECKPOINT_FILE.exists():
         CHECKPOINT_FILE.unlink()
         logger.info("チェックポイントをリセットしました")
-    done_dates = load_checkpoint()
-    logger.info(f"処理済み日付（前回分）: {len(done_dates)}件")
-
-    _auth_headers()  # APIキー確認
+    done_codes = load_checkpoint()
+    logger.info(f"処理済み銘柄（前回分）: {len(done_codes)}件")
 
     logger.info("Google Sheetsに接続中...")
     history_ws = get_sheets_client().open_by_key(
         os.environ["GOOGLE_SHEET_ID"]
     ).worksheet("history")
 
-    end_date   = date.today()
-    start_date = end_date - timedelta(days=args.days)
-    all_days   = _business_days(start_date, end_date)
-    pending    = [d for d in all_days if d.strftime("%Y%m%d") not in done_dates]
-    target_codes = MARKET_CODES[args.market]
+    # 銘柄一覧取得
+    if args.codes:
+        stocks = [{"code": c.strip()} for c in args.codes.split(",")]
+    else:
+        stocks = fetch_listed_codes(args.market)
 
-    logger.info(
-        f"取得対象: {start_date} 〜 {end_date} "
-        f"（{len(all_days)}営業日 / 未処理: {len(pending)}日）"
-    )
+    if not stocks:
+        print("❌ 銘柄一覧が取得できませんでした。--codes オプションで直接指定してください。")
+        sys.exit(1)
 
-    buffer: list[dict] = []
-    total_rows = 0
+    pending = [s for s in stocks if s["code"] not in done_codes]
+    logger.info(f"処理対象: {len(pending)}銘柄 / スキップ済み: {len(done_codes)}銘柄")
 
-    for i, target_date in enumerate(pending):
-        date_str = target_date.strftime("%Y%m%d")
-        records  = fetch_summary_by_date(target_date)
+    total_rows  = 0
+    skip_count  = 0
 
-        if records:
-            rows = summaries_to_history_rows(records, target_codes)
-            buffer.extend(rows)
-            logger.info(
-                f"[{i+1}/{len(pending)}] {date_str}: "
-                f"{len(records)}件取得 → {len(rows)}件変換"
-            )
-        else:
-            logger.info(f"[{i+1}/{len(pending)}] {date_str}: データなし")
+    for i, stock in enumerate(pending):
+        code = stock["code"]
+        logger.info(f"[{i+1}/{len(pending)}] {code} の過去データを取得中...")
 
-        done_dates.add(date_str)
+        docs = fetch_xbrl_urls_for_code(code)
+        if not docs:
+            logger.info(f"  → 対象開示なし（スキップ）")
+            skip_count += 1
+            done_codes.add(code)
+            time.sleep(SLEEP_BETWEEN_CODES)
+            continue
 
-        if len(buffer) >= 100:
-            logger.info(f"  Sheetsに{len(buffer)}件書き込み中...")
-            save_rows_to_sheets(buffer, history_ws)
-            total_rows += len(buffer)
-            buffer.clear()
-            save_checkpoint(done_dates)
+        saved = 0
+        for doc in docs:
+            summary = parse_disclosure(doc)
+            if summary and summary.operating_profit is not None:
+                save_summary_to_sheets(summary, history_ws)
+                saved += 1
+                total_rows += 1
+            time.sleep(SLEEP_BETWEEN_DOCS)
 
-        time.sleep(SLEEP_BETWEEN_REQUESTS)
+        logger.info(f"  → {len(docs)}件中 {saved}件保存")
+        done_codes.add(code)
 
-    if buffer:
-        logger.info(f"残り{len(buffer)}件をSheetsに書き込み中...")
-        save_rows_to_sheets(buffer, history_ws)
-        total_rows += len(buffer)
+        # 50銘柄ごとにチェックポイント保存
+        if (i + 1) % 50 == 0:
+            save_checkpoint(done_codes)
 
-    save_checkpoint(done_dates)
+        time.sleep(SLEEP_BETWEEN_CODES + random.uniform(0, 1.0))
+
+    save_checkpoint(done_codes)
 
     print("\n" + "=" * 50)
     print("✅ 完了！")
-    print(f"   処理日数  : {len(pending)}営業日")
-    print(f"   投入行数  : {total_rows}件")
+    print(f"   処理銘柄数 : {len(pending) - skip_count}銘柄")
+    print(f"   スキップ   : {skip_count}銘柄")
+    print(f"   投入行数   : {total_rows}件")
     print("=" * 50)
-    print()
-    print("⚠️  Freeプランご利用の場合:")
-    print("   データは12週間遅延のため、直近3ヶ月分は欠損します。")
-    print("   リアルタイム検知にはLightプラン以上が必要です。")
 
 
 if __name__ == "__main__":
