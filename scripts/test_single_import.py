@@ -39,13 +39,13 @@ def main():
         if summary:
             print(f"{'='*50}")
             print(f"タイトル  : {doc['title']}")
-            print(f"決算期末  : {summary.fiscal_year_end}")
+            print(f"決算期末  : {summary.fiscal_year_end}  ({summary.fiscal_year}年度)")
             print(f"四半期    : {summary.quarter}Q")
-            print(f"売上高    : {summary.net_sales:,.0f}万円")
-            print(f"営業利益  : {summary.operating_profit:,.0f}万円")
-            print(f"純利益    : {summary.net_income:,.0f}万円")
+            print(f"売上高    : {summary.cumulative_sales:,.0f}万円")
+            print(f"営業利益  : {summary.cumulative_op:,.0f}万円")
+            print(f"純利益    : {summary.cumulative_net:,.0f}万円")
             if summary.forecast_op:
-                progress = round(summary.operating_profit / summary.forecast_op * 100, 1)
+                progress = round(summary.cumulative_op / summary.forecast_op * 100, 1)
                 print(f"通期予想  : {summary.forecast_op:,.0f}万円（進捗{progress}%）")
             print(f"{'='*50}\n")
         else:

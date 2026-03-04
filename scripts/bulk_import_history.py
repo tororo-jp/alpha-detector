@@ -177,16 +177,14 @@ def fetch_xbrl_urls_for_code(code: str, retry: int = 0) -> list[dict]:
 
 def save_summary_to_sheets(summary: FinancialSummary, ws: gspread.Worksheet) -> None:
     """FinancialSummaryをhistoryシートに1行追記"""
-    fiscal_year = int(summary.fiscal_year_end[:4]) if summary.fiscal_year_end else 0
     ws.append_rows([[
         summary.code,
-        fiscal_year,
+        summary.fiscal_year,
         summary.quarter,
-        summary.net_sales,
-        summary.operating_profit,
-        summary.net_income,
-        round(summary.operating_profit / summary.forecast_op * 100, 1)
-            if summary.forecast_op else 0.0,
+        summary.cumulative_sales,
+        summary.cumulative_op,
+        summary.cumulative_net,
+        summary.progress_rate,
         datetime.now().isoformat(),
     ]], value_input_option="RAW")
 
@@ -235,11 +233,11 @@ def main() -> None:
             if summary:
                 print(f"\n{'='*50}")
                 print(f"コード    : {summary.code}")
-                print(f"決算期末  : {summary.fiscal_year_end}")
+                print(f"決算期末  : {summary.fiscal_year_end}  ({summary.fiscal_year}年度)")
                 print(f"四半期    : {summary.quarter}Q")
-                print(f"売上高    : {summary.net_sales:,.0f}万円")
-                print(f"営業利益  : {summary.operating_profit:,.0f}万円")
-                print(f"純利益    : {summary.net_income:,.0f}万円")
+                print(f"売上高    : {summary.cumulative_sales:,.0f}万円")
+                print(f"営業利益  : {summary.cumulative_op:,.0f}万円")
+                print(f"純利益    : {summary.cumulative_net:,.0f}万円")
                 print(f"通期予想  : {summary.forecast_op}万円")
                 print(f"{'='*50}\n")
             time.sleep(SLEEP_BETWEEN_DOCS)
@@ -294,7 +292,7 @@ def main() -> None:
         saved = 0
         for doc in docs:
             summary = parse_disclosure(doc)
-            if summary and summary.operating_profit is not None:
+            if summary and summary.cumulative_op is not None:
                 save_summary_to_sheets(summary, history_ws)
                 saved += 1
                 total_rows += 1

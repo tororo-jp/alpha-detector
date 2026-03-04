@@ -105,20 +105,16 @@ def save_history(code: str, summary) -> None:
     FinancialSummary を history シートに保存（同一キーは上書き）。
     summary: xbrl_parser.FinancialSummary
     """
-    fiscal_year   = int(summary.fiscal_year_end[:4]) if summary.fiscal_year_end else 0
+    fiscal_year   = summary.fiscal_year  # FinancialSummaryが直接持つ
     quarter       = summary.quarter
-    progress_rate = (
-        round(summary.operating_profit / summary.forecast_op * 100, 1)
-        if summary.forecast_op else 0.0
-    )
     row = [
         code,
         fiscal_year,
         quarter,
-        summary.net_sales,
-        summary.operating_profit,
-        summary.net_income,
-        progress_rate,
+        summary.cumulative_sales,
+        summary.cumulative_op,
+        summary.cumulative_net,
+        summary.progress_rate,
         datetime.now().isoformat(),
     ]
 
