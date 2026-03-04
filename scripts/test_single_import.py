@@ -2,62 +2,82 @@
 scripts/test_single_import.py
 ==============================
 bulk_import_history.py を実行する前に、
-1銘柄分の動作確認をするためのスクリプト。
+直近7日間のデータで動作確認するスクリプト。
+Sheetsへの書き込みは行わない。
 
-【使い方】
-  JQUANTS_API_KEY='...' python scripts/test_single_import.py --code 7203
+【使い方（PowerShell）】
+  $env:JQUANTS_API_KEY = "your-api-key"
+  python scripts/test_single_import.py
 
-J-Quantsから取得した生データと、変換後のhistory行を
-ターミナルに表示するのみ（Sheetsへの書き込みは行わない）。
+  # 取得日数を変更する場合
+  python scripts/test_single_import.py --days 14
 """
 
 import argparse
 import os
 import sys
+import time
+from datetime import date, timedelta
 
 sys.path.insert(0, "scripts")
 from bulk_import_history import (
-    _auth_headers,
-    fetch_fins_for_code,
-    statements_to_history_rows,
+    _business_days,
+    fetch_summary_by_date,
+    summaries_to_history_rows,
+    MARKET_CODES,
+    SLEEP_BETWEEN_REQUESTS,
 )
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--code", required=True, help="確認する証券コード（例: 1234）")
+    parser.add_argument("--days", type=int, default=7, help="確認する日数（デフォルト: 7日）")
+    parser.add_argument(
+        "--market", choices=["growth", "standard", "both"], default="both"
+    )
     args = parser.parse_args()
 
     if not os.environ.get("JQUANTS_API_KEY"):
         print("❌ JQUANTS_API_KEY を環境変数に設定してください")
         sys.exit(1)
 
-    print(f"[{args.code}] J-Quants V2 APIから財務データを取得中...")
-    statements = fetch_fins_for_code(args.code)
+    end_date   = date.today()
+    start_date = end_date - timedelta(days=args.days)
+    days       = _business_days(start_date, end_date)
+    target_codes = MARKET_CODES[args.market]
 
-    print(f"\n取得件数: {len(statements)}件の開示")
-    if not statements:
-        print("データが取得できませんでした。銘柄コードを確認してください。")
-        return
+    print(f"直近{args.days}日間（{len(days)}営業日）のデータを確認中...\n")
 
-    print("\n--- 変換後のhistoryシート用データ ---")
-    rows = statements_to_history_rows(args.code, statements)
-    rows.sort(key=lambda r: (r["fiscal_year"], r["quarter"]))
+    total_records = 0
+    total_rows    = 0
 
-    print(f"{'年度':<6} {'Q':<3} {'売上(万円)':<12} {'営業利益(万円)':<14} {'純利益(万円)':<12} {'進捗率':<8}")
-    print("-" * 60)
-    for r in rows:
-        print(
-            f"{r['fiscal_year']:<6} "
-            f"{r['quarter']}Q   "
-            f"{r['cumulative_sales']:>10,.0f}  "
-            f"{r['cumulative_op']:>12,.0f}  "
-            f"{r['cumulative_net']:>10,.0f}  "
-            f"{r['progress_rate']:>6.1f}%"
-        )
+    for target_date in days:
+        records = fetch_summary_by_date(target_date)
+        rows    = summaries_to_history_rows(records, target_codes)
+        total_records += len(records)
+        total_rows    += len(rows)
 
-    print(f"\n合計 {len(rows)}件がhistoryシートに投入される予定です。")
-    print("問題なければ bulk_import_history.py を実行してください。")
+        if rows:
+            print(f"【{target_date}】{len(records)}件取得 → {len(rows)}件変換")
+            print(f"  {'コード':<6} {'年度':<6} {'Q':<3} {'売上(万円)':>12} {'営業利益(万円)':>14} {'進捗率':>7}")
+            print(f"  {'-'*55}")
+            for r in rows[:5]:  # 最大5件だけ表示
+                print(
+                    f"  {r['code']:<6} {r['fiscal_year']:<6} {r['quarter']}Q  "
+                    f"{r['cumulative_sales']:>12,.0f} "
+                    f"{r['cumulative_op']:>14,.0f} "
+                    f"{r['progress_rate']:>6.1f}%"
+                )
+            if len(rows) > 5:
+                print(f"  ... 他{len(rows)-5}件")
+        else:
+            print(f"【{target_date}】データなし（休場日等）")
+
+        time.sleep(SLEEP_BETWEEN_REQUESTS)
+
+    print(f"\n合計: {total_records}件取得 → {total_rows}件がhistoryシートに投入されます")
+    print("\n問題なければ以下を実行してください:")
+    print("  python scripts/bulk_import_history.py")
 
 
 if __name__ == "__main__":

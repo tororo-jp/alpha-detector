@@ -97,13 +97,14 @@ Alpha-Detectorが自動検知（5分以内）
 | サービス | 用途 | 費用 |
 |---------|------|------|
 | **GitHub Actions** | スケジューラー・実行環境 | 無料（パブリックRepo） |
-| **J-Quants API** | 適時開示情報の取得 | 無料プラン |
+| **J-Quants API（Freeプラン）** | 初期データ投入 | 無料 |
+| **J-Quants API（Lightプラン）** | リアルタイム検知（本番稼働） | 1,650円/月〜 |
 | **yfinance** | 株価・出来高データ取得 | 無料 |
 | **Google Sheets** | 財務履歴・信用残DB | 無料 |
 | **JPX公式PDF** | 銘柄別信用取引週末残高 | 無料 |
 | **Discord Webhook** | 検知結果の通知 | 無料 |
 
-> **合計費用: 月0円〜** ※ J-Quantsを有料プランにする場合は月550円〜
+> **合計費用: 1,650円/月〜**（初期データ投入はFreeプランで無料）
 
 ---
 
@@ -302,36 +303,71 @@ cat service-account-key.json | tr -d '\n'
 ## 📥 初期データ投入
 
 過去3年分の財務履歴がないと全銘柄がスキップされます。  
-以下のスクリプトで一括取得してください。
+**初期データ投入はFreeプランで無料**で行えます。
 
-### J-Quants無料プランの制約
+### J-QuantsのプランとFreeプランの制約
 
-| プラン | 取得可能期間 | 費用 |
-|-------|------------|------|
-| 無料プラン | 過去**2年分**（12週遅延） | 無料 |
-| Lightプラン | 過去**3年分**（遅延なし） | 月550円〜 |
+| 用途 | エンドポイント | 必要プラン |
+|------|--------------|-----------|
+| **初期データ投入**（過去データ一括取得） | `/fins/summary`（日付指定） | **Freeプラン（無料）** |
+| **リアルタイム検知**（本番稼働） | `/fins/summary`（当日分） | **Lightプラン以上**（1,650円/月〜） |
 
-> **推奨:** まず無料プランで2年分投入して稼働開始。3年目以降は自動蓄積されます。
+> ⚠️ **Freeプランはデータが12週間（約3ヶ月）遅延します。**  
+> そのため過去データの取得には使えますが、当日の決算発表をリアルタイムで検知するにはLightプラン以上が必要です。
 
-### 実行手順
+### 取得方式の仕組み
 
-**① まず1銘柄でテスト（Sheetsへの書き込みなし）**
+旧方式（銘柄コード指定）ではLightプランが必要でしたが、  
+新方式（**日付ループ**）ではFreeプランで取得できます。
 
-```bash
-JQUANTS_API_KEY='...' python scripts/test_single_import.py --code 7203
+```
+1日分のリクエスト → その日に開示された全銘柄をまとめて取得
+3年分 ≒ 750営業日分のリクエスト → 処理時間 約15〜20分
 ```
 
-**② 全銘柄を一括投入（60〜90分）**
+### 実行手順（PowerShell）
 
-```bash
-JQUANTS_API_KEY='...' \
-GOOGLE_SHEETS_CREDS='...' \
-GOOGLE_SHEET_ID='...' \
-python scripts/bulk_import_history.py --market both
+**① まず直近7日間でテスト（Sheetsへの書き込みなし）**
+
+```powershell
+$env:JQUANTS_API_KEY = "your-api-key"
+python scripts/test_single_import.py --days 7
 ```
 
-> 中断しても `data/bulk_import_checkpoint.json` に進捗が保存されるため、  
-> 再実行すると続きから処理されます。
+正常なら以下のように表示されます:
+
+```
+直近7日間（5営業日）のデータを確認中...
+
+【2026-02-28】12件取得 → 8件変換
+  コード   年度     Q     売上(万円)   営業利益(万円)  進捗率
+  -------------------------------------------------------
+  1234   2025   2Q      120,000          8,000    48.0%
+  5678   2025   3Q      250,000         18,000    72.0%
+  ...
+```
+
+**② 全件投入（デフォルト：過去3年分 / 約15〜20分）**
+
+```powershell
+$env:JQUANTS_API_KEY    = "your-api-key"
+$env:GOOGLE_SHEET_ID    = "your-sheet-id"
+$env:GOOGLE_SHEETS_CREDS = Get-Clipboard   # JSONキーをコピー済みの場合
+
+python scripts/bulk_import_history.py
+```
+
+**中断後の再開**（そのままもう一度実行するだけ）
+
+```powershell
+python scripts/bulk_import_history.py
+```
+
+**最初からやり直す場合のみ**
+
+```powershell
+python scripts/bulk_import_history.py --reset-checkpoint
+```
 
 ---
 
@@ -391,6 +427,74 @@ alpha-detector/
 
 ---
 
+## 🚀 GitHubへの反映方法
+
+### 初回：リポジトリへのアップロード
+
+```powershell
+# 1. Gitが入っているか確認
+git --version
+
+# 2. プロジェクトフォルダに移動
+cd alpha-detector
+
+# 3. Gitを初期化
+git init
+
+# 4. GitHubのリポジトリをリモートに登録
+#    （GitHubで先にリポジトリを作成しておく）
+git remote add origin https://github.com/<あなたのユーザー名>/alpha-detector.git
+
+# 5. 全ファイルをステージング
+git add .
+
+# 6. コミット
+git commit -m "initial commit"
+
+# 7. プッシュ
+git push -u origin main
+```
+
+### ファイルを修正した後の反映
+
+```powershell
+# 変更されたファイルを確認
+git status
+
+# 全変更をステージング
+git add .
+
+# コミット（変更内容を簡潔に書く）
+git commit -m "bulk_import_history.py: 日付ループ方式に変更"
+
+# GitHubに反映
+git push
+```
+
+### よく使うGitコマンド
+
+| コマンド | 意味 |
+|---------|------|
+| `git status` | 変更されたファイルの一覧を確認 |
+| `git add .` | 全変更をステージング |
+| `git add src/main.py` | 特定ファイルだけをステージング |
+| `git commit -m "メッセージ"` | コミット（変更を記録） |
+| `git push` | GitHubに反映 |
+| `git pull` | GitHubから最新を取得 |
+| `git log --oneline` | コミット履歴を確認 |
+
+### GitHubにプッシュするとActionsが動かない場合
+
+コードのプッシュでActionsは自動起動しません。  
+Actionsはスケジュール（cron）または手動実行で動作します。
+
+手動で動作確認する場合:
+1. GitHubのリポジトリページを開く
+2. 「Actions」タブをクリック
+3. 「Alpha-Detector (Market Hours)」を選択
+4. 「Run workflow」をクリック
+
+---
 ## 🛠 トラブルシューティング
 
 | 症状 | 原因 | 対処 |
