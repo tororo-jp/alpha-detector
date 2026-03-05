@@ -351,7 +351,10 @@ python scripts/bulk_import_history.py
 python scripts/bulk_import_history.py --reset-checkpoint
 ```
 
-> ⏱ **処理時間**: 全銘柄（約3,000社）× 銘柄間2秒sleep → 約2〜4時間
+> ⏱ **処理時間の目安**
+> - JPX銘柄一覧が取得できた場合（方式①）: **約2〜4時間**（グロース+スタンダード 約3,000社）
+> - 取得できずフォールバックした場合（方式②）: **約3〜5時間**（コード総当たり、空振りは0.3秒で即スキップ）
+>
 > 途中で中断しても `data/bulk_import_checkpoint.json` に進捗が保存されます。
 
 ---

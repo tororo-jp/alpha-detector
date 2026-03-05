@@ -10,6 +10,13 @@ Google Sheetsのhistoryシートに投入するスクリプト。
   ・銘柄コード指定で過去5年分の開示一覧がJSONで返る
   ・J-Quants不要・完全無料・リアルタイム検知と同一のXBRLパース処理を使用
 
+【銘柄一覧の取得方式（自動フォールバック）】
+  ① JPX公式XLS（pandas が xlrd/openpyxl で読める場合）
+      → 市場区分フィルタ済みで正確・高速
+  ② TDnetコード総当たり（①が失敗した場合の自動フォールバック）
+      → 1000〜9999を順番にTDnetに問い合わせ、開示があるコードだけ処理
+      → 存在しないコードは0.3秒sleepで即スキップするため速度は許容範囲
+
 【使い方（PowerShell）】
   $env:GOOGLE_SHEET_ID    = "your-sheet-id"
   $env:GOOGLE_SHEETS_CREDS = Get-Clipboard   # JSONキーをコピー済みの場合
@@ -27,9 +34,8 @@ Google Sheetsのhistoryシートに投入するスクリプト。
   python scripts/bulk_import_history.py --reset-checkpoint
 
 【処理時間の目安】
-  対象銘柄（グロース+スタンダード）約3,000社 × 各社の決算件数
-  銘柄間: 2秒sleep → 約2〜4時間
-  ※ 時間がかかるため週末夜など空き時間に実行推奨
+  方式①（JPX XLS）: 約2〜4時間（グロース+スタンダード 約3,000社）
+  方式②（総当たり）: 約1〜2時間追加（空振り分の0.3秒sleepが加わる）
   ※ 途中中断→再開に対応（checkpointに処理済み銘柄を保存）
 """
 
@@ -54,8 +60,13 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 logger = logging.getLogger(__name__)
 
 # ── 定数 ──────────────────────────────────────────────────────────────────
-TDNET_JSON_URL  = "https://www.release.tdnet.info/inbs/I_list_00.json?Sccode={code}&Sort=1"
+TDNET_JSON_URL   = "https://www.release.tdnet.info/inbs/I_list_00.json?Sccode={code}&Sort=1"
 TDNET_LISTED_URL = "https://www.jpx.co.jp/markets/statistics-equities/misc/tvdivq0000001vg2-att/data_j.xls"
+
+# 東証グロース・スタンダードの銘柄コード範囲
+# 内国株は1000〜9999。プライムを除いた中小型が多い帯域をカバー
+CODE_RANGE_START = 1000
+CODE_RANGE_END   = 9999
 
 # 対象市場コード（J-Quants市場コードと同じ仕様）
 MARKET_CODES = {
@@ -92,29 +103,71 @@ def get_sheets_client() -> gspread.Client:
 
 def fetch_listed_codes(market: str) -> list[dict]:
     """
-    JPX公式の上場銘柄一覧（xls）から対象市場の銘柄コードを取得する。
-    取得できない場合は空リストを返す。
+    東証グロース・スタンダードの上場銘柄コード一覧を取得する。
+
+    取得方式（優先順）:
+      ① JPX公式XLS（pandas + xlrd が使える場合）
+      ② JPX公式XLS（openpyxl で代替できる場合）
+      ③ TDnetの銘柄別JSONに存在するコードをコード範囲総当たりで収集
+
+    どの方式でも同じ list[{"code": str}] 形式で返す。
     """
-    target_codes = MARKET_CODES.get(market, MARKET_CODES["both"])
+    # ── 方式①②: JPX公式XLS ─────────────────────────────────────────────
+    codes = _fetch_from_jpx_xls(market)
+    if codes:
+        return codes
 
-    # JPXのCSV/XLSから取得を試みる
-    try:
-        import pandas as pd
-        logger.info("JPX上場銘柄一覧を取得中...")
-        df = pd.read_excel(TDNET_LISTED_URL, header=0)
-        # 列名を確認して市場区分で絞り込み
-        # 列名は「市場・商品区分」「コード」「銘柄名」など
-        code_col = [c for c in df.columns if "コード" in str(c)]
-        market_col = [c for c in df.columns if "市場" in str(c)]
-        if code_col and market_col:
-            filtered = df[df[market_col[0]].astype(str).str.contains("グロース|スタンダード", na=False)]
-            codes = [{"code": str(c).zfill(4)[:4]} for c in filtered[code_col[0]].dropna()]
-            logger.info(f"JPX一覧から{len(codes)}銘柄を取得")
-            return codes
-    except Exception as e:
-        logger.warning(f"JPX一覧取得失敗: {e}")
+    # ── 方式③: TDnet総当たり（フォールバック）──────────────────────────
+    logger.info("JPX XLS取得不可 → TDnetコード総当たり方式にフォールバックします")
+    logger.info(f"コード範囲 {CODE_RANGE_START}〜{CODE_RANGE_END} を順番に確認します")
+    logger.info("（TDnetに開示履歴があるコードのみ処理対象になります）")
+    return [{"code": str(c).zfill(4)} for c in range(CODE_RANGE_START, CODE_RANGE_END + 1)]
 
-    logger.warning("銘柄一覧の自動取得に失敗しました。--codes オプションで指定してください。")
+
+def _fetch_from_jpx_xls(market: str) -> list[dict]:
+    """
+    JPX公式XLS（data_j.xls）から市場フィルタ済みの銘柄コード一覧を返す。
+    取得失敗時は空リストを返す。
+    """
+    import pandas as pd
+
+    # グロース・スタンダードの市場区分名（XLS内の表記）
+    market_keywords = {
+        "growth"  : ["グロース"],
+        "standard": ["スタンダード"],
+        "both"    : ["グロース", "スタンダード"],
+    }.get(market, ["グロース", "スタンダード"])
+    pattern = "|".join(market_keywords)
+
+    # xlrd（旧XLS用）と openpyxl（新XLSX用）の両方を試す
+    for engine in [None, "openpyxl", "xlrd"]:
+        try:
+            kwargs = {"header": 0}
+            if engine:
+                kwargs["engine"] = engine
+            logger.info(f"JPX上場銘柄一覧を取得中... (engine={engine or 'auto'})")
+            df = pd.read_excel(TDNET_LISTED_URL, **kwargs)
+
+            code_cols   = [c for c in df.columns if "コード" in str(c)]
+            market_cols = [c for c in df.columns if "市場" in str(c)]
+            if not code_cols or not market_cols:
+                continue
+
+            filtered = df[df[market_cols[0]].astype(str).str.contains(pattern, na=False)]
+            codes = [
+                {"code": str(int(c)).zfill(4)}
+                for c in filtered[code_cols[0]].dropna()
+                if str(c).replace(".0", "").isdigit()
+            ]
+            if codes:
+                logger.info(f"JPX一覧から {len(codes)} 銘柄を取得")
+                return codes
+        except ImportError:
+            continue   # engineが入っていない場合はスキップ
+        except Exception as e:
+            logger.warning(f"JPX XLS取得失敗 (engine={engine}): {e}")
+            continue
+
     return []
 
 
@@ -283,10 +336,11 @@ def main() -> None:
 
         docs = fetch_xbrl_urls_for_code(code)
         if not docs:
-            logger.info(f"  → 対象開示なし（スキップ）")
+            logger.debug(f"  → [{code}] 開示なし（スキップ）")
             skip_count += 1
             done_codes.add(code)
-            time.sleep(SLEEP_BETWEEN_CODES)
+            # 総当たり時は空振りが多いので短いsleepで効率化
+            time.sleep(0.3)
             continue
 
         saved = 0
