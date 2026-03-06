@@ -284,12 +284,14 @@ python scripts/setup_sheets.py
 
 ### 仕組み
 
+TDnetの銘柄コード指定URLは存在しないため、**日付指定URL**（リアルタイム検知と同じURL）を過去3年分ループします。
+
 ```
-TDnet 銘柄別 JSON
-https://www.release.tdnet.info/inbs/I_list_00.json?Sccode={code}
-  → 過去5年分の開示一覧（XBRL ZIP URLを含む）
-  → リアルタイム検知と全く同じXBRLパース処理を使用
-  → Google Sheetsのhistoryシートに自動投入
+I_list_001_YYYYMMDD.html（1日1リクエスト）
+  → その日に発表された全銘柄の開示をまとめて取得
+  → 決算短信・業績修正・配当修正のみフィルタ
+  → XBRL ZIPをダウンロード・パース（リアルタイム検知と同一処理）
+  → Google Sheetsのhistoryシートに追記
 ```
 
 ### 実行手順（PowerShell）
@@ -298,7 +300,7 @@ https://www.release.tdnet.info/inbs/I_list_00.json?Sccode={code}
 
 ```powershell
 # 依存ライブラリのインストール
-pip install requests beautifulsoup4 lxml gspread google-auth yfinance pandas openpyxl
+pip install requests beautifulsoup4 lxml gspread google-auth yfinance pandas openpyxl xlrd
 ```
 
 #### ② JSONキーを1行に圧縮してクリップボードにコピー
@@ -308,36 +310,34 @@ pip install requests beautifulsoup4 lxml gspread google-auth yfinance pandas ope
   -replace "`r`n|`n", "" | Set-Clipboard
 ```
 
-#### ③ 1銘柄でテスト（Sheetsへの書き込みなし）
+#### ③ 直近7日間でテスト（Sheetsへの書き込みなし）
 
 ```powershell
-python scripts/test_single_import.py --code 7203
+python scripts/test_single_import.py
 ```
 
 正常なら以下のように表示されます:
 ```
-[7203] TDnetから開示一覧を取得中...
-8件の対象開示を発見
+直近7日間（5営業日）の開示を確認します...
 
-直近3件のXBRLをパースします...
-
-==================================================
-タイトル  : 2024年3月期第2四半期決算短信〔日本基準〕（連結）
-決算期末  : 2024-03-31
-四半期    : 2Q
-売上高    : 2,800,000万円
-営業利益  :   250,000万円
-純利益    :   180,000万円
-通期予想  :   520,000万円（進捗48.1%）
-==================================================
+【2026-03-04】3件の対象開示
+  ✅ [2590] 2026年1月期 決算短信〔日本基準〕（連結）
+       2Q  売上:120,000万  営業利益:8,500万  進捗:52.3%
+  ✅ [3816] ...
 ```
 
-#### ④ 全件投入（全銘柄・約2〜4時間）
+#### ④ 動作確認（dry-runモード・Sheetsへの書き込みなし）
 
 ```powershell
 $env:GOOGLE_SHEET_ID    = "your-sheet-id"
 $env:GOOGLE_SHEETS_CREDS = Get-Clipboard
 
+python scripts/bulk_import_history.py --dry-run --days 30
+```
+
+#### ⑤ 全件投入（過去3年分 / 6〜12時間）
+
+```powershell
 python scripts/bulk_import_history.py
 ```
 
@@ -352,10 +352,10 @@ python scripts/bulk_import_history.py --reset-checkpoint
 ```
 
 > ⏱ **処理時間の目安**
-> - JPX銘柄一覧が取得できた場合（方式①）: **約2〜4時間**（グロース+スタンダード 約3,000社）
-> - 取得できずフォールバックした場合（方式②）: **約3〜5時間**（コード総当たり、空振りは0.3秒で即スキップ）
+> 3年分 ≒ 780営業日。決算集中月（2・3・5・8・11月）は1日あたり30〜60件のXBRL取得が発生。
+> 全体で **6〜12時間程度**（overnight実行推奨）。
 >
-> 途中で中断しても `data/bulk_import_checkpoint.json` に進捗が保存されます。
+> 10日ごとにチェックポイントが保存されるため、途中中断しても再開できます。
 
 ---
 
