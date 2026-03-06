@@ -1,181 +1,289 @@
 """
 xbrl_parser.py
-J-Quants API V2のJSONサマリーからXBRL財務データを抽出するモジュール。
+==============
+TDnet XBRLのZIPをダウンロード・展開し、
+Summaryフォルダの ixbrl.htm から財務数値を抽出するモジュール。
 
-【V2変更点】
-  - 認証: Authorization Bearer → x-api-key ヘッダー
-  - エンドポイント: /v1/documents/{id}/summary → /v2/documents/{id}/summary
-  - レスポンスキー: "summary" → "data"[0] の場合あり（要確認）
+【処理フロー】
+  XBRL ZIP URL
+    ↓ ダウンロード（requests）
+    ↓ メモリ上でZIP展開（zipfile）
+  Summary/*ixbrl*.htm
+    ↓ BeautifulSoupで ix:nonfraction / ix:nonnumeric タグを解析
+  FinancialSummary（dataclass）
 
-抽出対象:
-  - 売上高（累計）
-  - 営業利益（累計）
-  - 純利益（累計）
-  - 通期予想進捗率
-  - 対象四半期
-  - 修正フラグ
-  - 増配フラグ
+【対応会計基準】
+  JP GAAP / IFRS / US GAAP（タグ名優先順で最初に見つかった値を使用）
+
+【金額の単位変換】
+  scale属性（百万円単位など）→ 円単位 → 万円単位に統一
 """
 
+import io
 import logging
-import requests
+import re
+import time
+import zipfile
 from dataclasses import dataclass
 
+import requests
+from bs4 import BeautifulSoup, Tag
+
 logger = logging.getLogger(__name__)
+SLEEP_SEC = 1.5
 
-# 書類種別コードと意味
-TYPE_REVISION    = "160"  # 業績予想修正
-TYPE_DIVIDEND    = "170"  # 配当予想修正
 
+# ── FinancialSummary（全モジュール共通のデータクラス）──────────────────
 
 @dataclass
 class FinancialSummary:
-    code: str
-    company_name: str
-    fiscal_year: int
-    quarter: int                     # 1〜4
-    cumulative_sales: float          # 累計売上高（万円）
-    cumulative_op: float             # 累計営業利益（万円）
-    cumulative_net: float            # 累計純利益（万円）
-    full_year_op_forecast: float     # 通期営業利益予想（万円）
-    progress_rate: float             # 通期予想比進捗率（%）
-    has_upward_revision: bool        # 上方修正フラグ
-    has_dividend_increase: bool      # 増配フラグ
-    document_id: str
+    code              : str         = ""
+    company_name      : str         = ""
+    fiscal_year_end   : str         = ""    # "YYYY-MM-DD"
+    fiscal_year       : int         = 0     # 会計年度（fiscal_year_end の年）
+    quarter           : int         = 0     # 1/2/3/4
+    # 累計値（万円）
+    cumulative_sales  : float       = 0.0
+    cumulative_op     : float       = 0.0   # 営業利益
+    cumulative_net    : float       = 0.0   # 純利益
+    # 通期予想営業利益（万円）
+    forecast_op       : float | None = None
+    # 今回の進捗率（%）: cumulative_op / forecast_op * 100
+    progress_rate     : float       = 0.0
+    # 修正・配当フラグ
+    has_upward_revision    : bool   = False
+    has_dividend_increase  : bool   = False
+    prev_dividend     : float | None = None
+    curr_dividend     : float | None = None
 
 
-def parse_disclosure(doc: dict) -> FinancialSummary | None:
-    """
-    開示情報から財務サマリーを取得・パースする。（V2: APIキー認証）
+# ── XBRL タグ定義 ─────────────────────────────────────────────────────
 
-    Args:
-        doc: fetch_new_disclosures()が返す開示情報dict
+SALES_TAGS = [
+    "NetSales",
+    "NetSalesIFRS",
+    "RevenueIFRS",
+    "SalesIFRS",
+    "NetSalesUS",
+    "OperatingRevenues",
+    "OperatingRevenuesIFRS",
+]
+OP_TAGS = [
+    "OperatingIncome",
+    "OperatingProfit",
+    "OperatingProfitLossIFRS",
+    "OperatingIncomeUS",
+    "OrdinaryIncome",
+]
+NET_TAGS = [
+    "NetIncome",
+    "ProfitLossIFRS",
+    "NetIncomeUS",
+    "ProfitAttributableToOwnersOfParentIFRS",
+    "ProfitLoss",
+]
+FORECAST_OP_TAGS = [
+    "ForecastOperatingIncome",
+    "ForecastOperatingProfit",
+    "ForecastOperatingProfitLossIFRS",
+]
 
-    Returns:
-        FinancialSummary or None（パース失敗・対象外の場合）
-    """
-    from tdnet_watcher import _auth_headers
-    code       = doc["code"]
-    doc_id     = doc["document_id"]
-    type_code  = doc["type_code"]
+PERIOD_MAP = {
+    "q1": 1, "q2": 2, "q3": 3, "q4": 4,
+    "1q": 1, "2q": 2, "3q": 3, "4q": 4,
+    "fy": 4, "annual": 4,
+}
 
+CURRENT_CTX = re.compile(
+    r"(CurrentYearDuration|CurrentAccumulatedQ[1-3]Duration)",
+    re.IGNORECASE,
+)
+FORECAST_CTX = re.compile(r"Forecast", re.IGNORECASE)
+
+
+# ── ユーティリティ ────────────────────────────────────────────────────
+
+def _to_float(text: str) -> float | None:
+    if not text:
+        return None
+    text = text.strip().replace(",", "").replace("\xa0", "").replace(" ", "")
+    negative = text.startswith("△") or text.startswith("-")
+    text = text.lstrip("△").lstrip("-").strip()
     try:
-        summary = _fetch_financial_summary(code, doc_id, _auth_headers())
-        if not summary:
-            return None
-
-        quarter = _extract_quarter(summary)
-        if quarter is None:
-            logger.info(f"[{code}] 四半期情報を取得できず → スキップ")
-            return None
-
-        # 各財務数値（万円単位に統一: APIは円単位で返すことが多い）
-        cum_sales = _to_man_yen(summary.get("NetSales"))
-        cum_op    = _to_man_yen(summary.get("OperatingProfit"))
-        cum_net   = _to_man_yen(summary.get("NetIncome") or summary.get("Profit"))
-        fy_op     = _to_man_yen(summary.get("ForecastOperatingProfit"))
-
-        if cum_op is None or cum_sales is None or cum_net is None:
-            logger.warning(f"[{code}] 主要財務数値が欠損 → スキップ")
-            return None
-
-        # 進捗率の計算
-        if fy_op and fy_op != 0:
-            progress_rate = round(cum_op / fy_op * 100, 1)
-        else:
-            progress_rate = 0.0
-
-        # 修正・増配フラグ
-        has_revision = (
-            type_code == TYPE_REVISION
-            or bool(summary.get("IsRevision"))
-            or bool(summary.get("RevisionFlag"))
-        )
-        has_upward = has_revision and (
-            bool(summary.get("IsUpwardRevision"))
-            or (
-                _to_man_yen(summary.get("ForecastOperatingProfitRevision", 0)) or 0
-            ) > 0
-        )
-        has_div_increase = (
-            type_code == TYPE_DIVIDEND
-            or bool(summary.get("IsDividendIncrease"))
-        )
-
-        fiscal_year = _extract_fiscal_year(summary)
-
-        return FinancialSummary(
-            code=code,
-            company_name=doc.get("company_name", ""),
-            fiscal_year=fiscal_year,
-            quarter=quarter,
-            cumulative_sales=cum_sales,
-            cumulative_op=cum_op,
-            cumulative_net=cum_net,
-            full_year_op_forecast=fy_op or 0.0,
-            progress_rate=progress_rate,
-            has_upward_revision=has_upward,
-            has_dividend_increase=has_div_increase,
-            document_id=doc_id,
-        )
-
-    except Exception as e:
-        logger.error(f"[{code}] parse_disclosure failed: {e}")
+        return -float(text) if negative else float(text)
+    except ValueError:
         return None
 
 
-def _fetch_financial_summary(code: str, doc_id: str, headers: dict) -> dict | None:
-    """J-Quants API V2から財務サマリーを取得"""
-    url = f"https://api.jquants.com/v2/documents/{doc_id}/summary"
+def _to_man_yen(val: float, tag: Tag) -> float:
+    """scale属性を適用して円→万円変換"""
     try:
-        res = requests.get(url, headers=headers, timeout=15)
-        res.raise_for_status()
-        data = res.json()
-        # V2レスポンスは {"data": [...]} または {"summary": {...}} の場合がある
-        if "data" in data and isinstance(data["data"], list) and data["data"]:
-            return data["data"][0]
-        return data.get("summary") or data.get("financialStatement") or data
-    except Exception as e:
-        logger.error(f"[{code}] J-Quants V2 summary fetch failed: {e}")
-        return None
+        scale = int(tag.get("scale") or tag.get("Scale") or 0)
+    except (ValueError, TypeError):
+        scale = 0
+    return round(val * (10 ** scale) / 10_000, 1)
 
 
-def _extract_quarter(summary: dict) -> int | None:
-    """四半期番号（1〜4）を取得"""
-    # J-Quantsは "TypeOfCurrentPeriod" として "1Q", "2Q" 等を返す
-    period = summary.get("TypeOfCurrentPeriod", "")
-    mapping = {"1Q": 1, "2Q": 2, "3Q": 3, "4Q": 4, "FY": 4}
-    if period in mapping:
-        return mapping[period]
-
-    # フォールバック: 月数から推定
-    months = summary.get("CumulativeMonths")
-    if months:
-        return {3: 1, 6: 2, 9: 3, 12: 4}.get(int(months))
-
+def _find_value(soup: BeautifulSoup, short_names: list[str], ctx_pat: re.Pattern) -> float | None:
+    for name in short_names:
+        elems = soup.find_all(
+            "ix:nonfraction",
+            attrs={"name": re.compile(name, re.IGNORECASE)},
+        )
+        for elem in elems:
+            ctx = elem.get("contextref") or elem.get("contextRef") or ""
+            if ctx_pat.search(ctx):
+                raw = _to_float(elem.get_text())
+                if raw is not None:
+                    return _to_man_yen(raw, elem)
     return None
 
 
-def _extract_fiscal_year(summary: dict) -> int:
-    """会計年度（西暦）を取得"""
-    fy = summary.get("FiscalYear") or summary.get("FiscalYearEndDate", "")
-    if isinstance(fy, int):
-        return fy
-    if isinstance(fy, str) and len(fy) >= 4:
-        try:
-            return int(fy[:4])
-        except ValueError:
-            pass
-    from datetime import datetime
-    return datetime.now().year
+def _detect_quarter(soup: BeautifulSoup) -> int:
+    for tag in soup.find_all("ix:nonnumeric"):
+        name = (tag.get("name") or "").lower()
+        if "typeofcurrentperiod" in name:
+            val = tag.get_text(strip=True).lower()
+            for k, v in PERIOD_MAP.items():
+                if k in val:
+                    return v
+    for elem in soup.find_all("ix:nonfraction"):
+        ctx = (elem.get("contextref") or elem.get("contextRef") or "").lower()
+        if "accumulatedq3" in ctx: return 3
+        if "accumulatedq2" in ctx: return 2
+        if "accumulatedq1" in ctx: return 1
+        if "currentyear"   in ctx: return 4
+    return 0
 
 
-def _to_man_yen(value) -> float | None:
-    """円単位の値を万円単位に変換。Noneや無効値はNoneを返す"""
-    if value is None:
+def _detect_fiscal_year_end(soup: BeautifulSoup) -> str:
+    for tag in soup.find_all("ix:nonnumeric"):
+        name = (tag.get("name") or "").lower()
+        if "fiscalyearend" in name or "currentfiscalyearenddate" in name:
+            val = tag.get_text(strip=True).replace("/", "-")
+            if re.match(r"\d{4}-\d{2}-\d{2}", val):
+                return val
+    return ""
+
+
+def _detect_flags(soup: BeautifulSoup, title: str) -> tuple[bool, bool, float | None, float | None]:
+    """(has_upward_revision, has_dividend_increase, prev_div, curr_div)"""
+    is_rev    = "業績予想の修正" in title
+    is_div_up = False
+    prev_div  = None
+    curr_div  = None
+    if "配当予想の修正" in title:
+        for tag in soup.find_all("ix:nonfraction"):
+            name = (tag.get("name") or "").lower()
+            if "dividendpershare" in name:
+                val = _to_float(tag.get_text())
+                ctx = (tag.get("contextref") or "").lower()
+                if "before" in ctx or "prior" in ctx:
+                    prev_div = val
+                elif "after" in ctx or "revised" in ctx:
+                    curr_div = val
+        if prev_div is not None and curr_div is not None:
+            is_div_up = curr_div > prev_div
+    return is_rev, is_div_up, prev_div, curr_div
+
+
+# ── ZIPダウンロード・パース ───────────────────────────────────────────
+
+def _download_and_parse(zip_url: str, retry: int = 0) -> BeautifulSoup | None:
+    try:
+        res = requests.get(zip_url, timeout=20)
+        if res.status_code == 429 and retry < 3:
+            logger.warning("429 Rate limit. 30秒待機...")
+            time.sleep(30)
+            return _download_and_parse(zip_url, retry + 1)
+        res.raise_for_status()
+    except requests.RequestException as e:
+        logger.warning(f"ZIP取得失敗 {zip_url}: {e}")
         return None
     try:
-        v = float(value)
-        return round(v / 10000, 1)
-    except (ValueError, TypeError):
+        with zipfile.ZipFile(io.BytesIO(res.content)) as zf:
+            candidates = [
+                n for n in zf.namelist()
+                if "summary" in n.lower() and n.lower().endswith((".htm", ".html"))
+            ]
+            if not candidates:
+                candidates = [
+                    n for n in zf.namelist()
+                    if "ixbrl" in n.lower() and n.lower().endswith((".htm", ".html"))
+                ]
+            if not candidates:
+                logger.warning(f"ixbrl.htm が見つかりません: {zip_url}")
+                return None
+            content = zf.read(candidates[0]).decode("utf-8", errors="replace")
+    except (zipfile.BadZipFile, KeyError) as e:
+        logger.warning(f"ZIP展開失敗: {e}")
         return None
+    return BeautifulSoup(content, "html.parser")
+
+
+# ── メイン関数 ────────────────────────────────────────────────────────
+
+def parse_disclosure(doc: dict) -> "FinancialSummary | None":
+    """
+    開示情報dict → FinancialSummary。
+    失敗時は None を返す。
+
+    Args:
+        doc: {
+          "document_id": str,
+          "code": str,
+          "company_name": str,
+          "title": str,
+          "xbrl_zip_url": str,
+        }
+    """
+    zip_url = doc.get("xbrl_zip_url", "")
+    title   = doc.get("title", "")
+    code    = doc.get("code", "")
+
+    if not zip_url:
+        return None
+
+    logger.info(f"[{code}] XBRL取得中: {zip_url}")
+    soup = _download_and_parse(zip_url)
+    if soup is None:
+        return None
+
+    time.sleep(SLEEP_SEC)
+
+    cum_sales  = _find_value(soup, SALES_TAGS,       CURRENT_CTX)
+    cum_op     = _find_value(soup, OP_TAGS,           CURRENT_CTX)
+    cum_net    = _find_value(soup, NET_TAGS,           CURRENT_CTX)
+    forecast   = _find_value(soup, FORECAST_OP_TAGS,  FORECAST_CTX)
+
+    if cum_op is None or cum_sales is None:
+        logger.warning(f"[{code}] 営業利益 or 売上高が取得できませんでした")
+        return None
+
+    quarter        = _detect_quarter(soup)
+    fy_end         = _detect_fiscal_year_end(soup)
+    fiscal_year    = int(fy_end[:4]) if fy_end else 0
+
+    if quarter == 0:
+        logger.warning(f"[{code}] 四半期区分が判定できませんでした")
+        return None
+
+    progress = round(cum_op / forecast * 100, 1) if forecast else 0.0
+    is_rev, is_div_up, prev_div, curr_div = _detect_flags(soup, title)
+
+    return FinancialSummary(
+        code                  = code,
+        company_name          = doc.get("company_name", ""),
+        fiscal_year_end       = fy_end,
+        fiscal_year           = fiscal_year,
+        quarter               = quarter,
+        cumulative_sales      = cum_sales,
+        cumulative_op         = cum_op,
+        cumulative_net        = cum_net if cum_net is not None else 0.0,
+        forecast_op           = forecast,
+        progress_rate         = progress,
+        has_upward_revision   = is_rev,
+        has_dividend_increase = is_div_up,
+        prev_dividend         = prev_div,
+        curr_dividend         = curr_div,
+    )

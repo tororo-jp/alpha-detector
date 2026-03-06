@@ -1,64 +1,59 @@
 """
 scripts/test_single_import.py
 ==============================
-bulk_import_history.py を実行する前に、
-1銘柄分の動作確認をするためのスクリプト。
+1銘柄分の動作確認スクリプト。
+Sheetsへの書き込みは行わない。
 
-【使い方】
-  JQUANTS_API_KEY='...' python scripts/test_single_import.py --code 7203
-
-J-Quantsから取得した生データと、変換後のhistory行を
-ターミナルに表示するのみ（Sheetsへの書き込みは行わない）。
+【使い方（PowerShell）】
+  python scripts/test_single_import.py --code 7203
 """
-
 import argparse
-import os
 import sys
+from pathlib import Path
 
-sys.path.insert(0, "scripts")
-from bulk_import_history import (
-    _auth_headers,
-    fetch_fins_for_code,
-    statements_to_history_rows,
-)
-
+sys.path.insert(0, str(Path(__file__).parent))
+from bulk_import_history import fetch_xbrl_urls_for_code
+sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
+from xbrl_parser import parse_disclosure
+import time
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--code", required=True, help="確認する証券コード（例: 1234）")
+    parser.add_argument("--code", required=True, help="証券コード（例: 7203）")
     args = parser.parse_args()
 
-    if not os.environ.get("JQUANTS_API_KEY"):
-        print("❌ JQUANTS_API_KEY を環境変数に設定してください")
-        sys.exit(1)
+    print(f"\n[{args.code}] TDnetから開示一覧を取得中...")
+    docs = fetch_xbrl_urls_for_code(args.code)
 
-    print(f"[{args.code}] J-Quants V2 APIから財務データを取得中...")
-    statements = fetch_fins_for_code(args.code)
-
-    print(f"\n取得件数: {len(statements)}件の開示")
-    if not statements:
-        print("データが取得できませんでした。銘柄コードを確認してください。")
+    if not docs:
+        print("開示データが見つかりませんでした。")
         return
 
-    print("\n--- 変換後のhistoryシート用データ ---")
-    rows = statements_to_history_rows(args.code, statements)
-    rows.sort(key=lambda r: (r["fiscal_year"], r["quarter"]))
+    print(f"{len(docs)}件の対象開示を発見:\n")
+    for i, d in enumerate(docs):
+        print(f"  {i+1}. {d['title']}")
 
-    print(f"{'年度':<6} {'Q':<3} {'売上(万円)':<12} {'営業利益(万円)':<14} {'純利益(万円)':<12} {'進捗率':<8}")
-    print("-" * 60)
-    for r in rows:
-        print(
-            f"{r['fiscal_year']:<6} "
-            f"{r['quarter']}Q   "
-            f"{r['cumulative_sales']:>10,.0f}  "
-            f"{r['cumulative_op']:>12,.0f}  "
-            f"{r['cumulative_net']:>10,.0f}  "
-            f"{r['progress_rate']:>6.1f}%"
-        )
+    print(f"\n直近3件のXBRLをパースします...\n")
+    for doc in docs[:3]:
+        summary = parse_disclosure(doc)
+        if summary:
+            print(f"{'='*50}")
+            print(f"タイトル  : {doc['title']}")
+            print(f"決算期末  : {summary.fiscal_year_end}  ({summary.fiscal_year}年度)")
+            print(f"四半期    : {summary.quarter}Q")
+            print(f"売上高    : {summary.cumulative_sales:,.0f}万円")
+            print(f"営業利益  : {summary.cumulative_op:,.0f}万円")
+            print(f"純利益    : {summary.cumulative_net:,.0f}万円")
+            if summary.forecast_op:
+                progress = round(summary.cumulative_op / summary.forecast_op * 100, 1)
+                print(f"通期予想  : {summary.forecast_op:,.0f}万円（進捗{progress}%）")
+            print(f"{'='*50}\n")
+        else:
+            print(f"  ⚠️ {doc['title']} → パース失敗")
+        time.sleep(1.5)
 
-    print(f"\n合計 {len(rows)}件がhistoryシートに投入される予定です。")
-    print("問題なければ bulk_import_history.py を実行してください。")
-
+    print("問題なければ以下を実行してください:")
+    print("  python scripts/bulk_import_history.py")
 
 if __name__ == "__main__":
     main()

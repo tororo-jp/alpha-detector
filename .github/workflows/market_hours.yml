@@ -2,10 +2,10 @@ name: Alpha-Detector (Market Hours)
 
 on:
   schedule:
-    # 15:00〜16:05 JST (= UTC 06:00〜07:05) を5分間隔でカバー
+    # 決算発表時間帯 15:00〜16:05 JST (UTC 06:00〜07:05) を5分間隔で実行
     - cron: '0,5,10,15,20,25,30,35,40,45,50,55 6 * * 1-5'
     - cron: '0,5 7 * * 1-5'
-  workflow_dispatch: # 手動実行
+  workflow_dispatch:  # 手動実行ボタン
 
 jobs:
   detect:
@@ -13,7 +13,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # 処理済み開示IDを前回実行から引き継ぐ
+      # 処理済み開示IDを前回実行から引き継ぐ（重複処理防止）
       - name: Restore processed IDs cache
         uses: actions/cache@v4
         with:
@@ -34,10 +34,12 @@ jobs:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           GOOGLE_SHEETS_CREDS: ${{ secrets.GOOGLE_SHEETS_CREDS }}
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
-          JQUANTS_API_KEY: ${{ secrets.JQUANTS_API_KEY }}
-        run: python src/main.py
+          # J-Quants APIキーは不要（TDnetスクレイピング方式）
+        run: |
+          cd src
+          python main.py
 
-      # 処理済みIDを保存（次回実行で重複処理を防ぐ）
+      # 処理済みIDを次回実行のために保存
       - name: Save processed IDs cache
         uses: actions/cache@v4
         with:

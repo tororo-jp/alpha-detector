@@ -1,151 +1,118 @@
 """
 notifier.py
-Discordへのスコアリング結果通知モジュール。
+===========
+Discord Webhook へのスコアリング結果通知モジュール。
 """
 
-import os
 import logging
+import os
 import requests
-from dataclasses import dataclass
 
 from scoring_engine import ScoreResult
 from xbrl_parser import FinancialSummary
 
 logger = logging.getLogger(__name__)
-
 GRADE_EMOJI = {"S": "🔥", "A": "📈", "B": "📊"}
 
 
 def notify_result(
-    score: ScoreResult,
-    summary: FinancialSummary,
-    price_data: dict | None,
-    margin_data: dict | None,
+    summary     : FinancialSummary,
+    score       : ScoreResult,
+    price_data  : dict | None,
+    margin_data : dict | None,
 ) -> None:
-    """
-    スコアリング結果をDiscordに通知する。
-    grade が S または A の場合のみ通知（Bはスキップ）。
-    """
     if score.grade not in ("S", "A"):
-        logger.info(f"[{score.code}] grade={score.grade} → 通知スキップ")
         return
-
     webhook_url = os.environ.get("DISCORD_WEBHOOK_URL", "")
     if not webhook_url:
         logger.error("DISCORD_WEBHOOK_URL が設定されていません")
         return
-
-    message = _format_message(score, summary, price_data, margin_data)
-
+    msg = _format(summary, score, price_data, margin_data)
     try:
-        res = requests.post(
-            webhook_url,
-            json={"content": message},
-            timeout=15,
-        )
-        res.raise_for_status()
-        logger.info(f"[{score.code}] Discord通知完了 (grade={score.grade})")
+        requests.post(webhook_url, json={"content": msg}, timeout=15).raise_for_status()
+        logger.info(f"[{score.code}] Discord通知完了 ({score.grade}評価)")
     except Exception as e:
         logger.error(f"[{score.code}] Discord通知失敗: {e}")
 
 
 def notify_error(message: str) -> None:
-    """エラー通知（システム異常・PDFパース失敗など）"""
     webhook_url = os.environ.get("DISCORD_WEBHOOK_URL", "")
     if not webhook_url:
         return
     try:
         requests.post(
             webhook_url,
-            json={"content": f"⚠️ **[Alpha-Detector システムエラー]**\n{message}"},
+            json={"content": f"⚠️ **[Alpha-Detector エラー]**\n{message}"},
             timeout=15,
         )
-    except Exception as e:
-        logger.error(f"エラー通知失敗: {e}")
+    except Exception:
+        pass
 
 
-def _format_message(
-    score: ScoreResult,
-    summary: FinancialSummary,
-    price_data: dict | None,
-    margin_data: dict | None,
+def _format(
+    summary     : FinancialSummary,
+    score       : ScoreResult,
+    price_data  : dict | None,
+    margin_data : dict | None,
 ) -> str:
-    emoji = GRADE_EMOJI.get(score.grade, "📊")
+    emoji   = GRADE_EMOJI.get(score.grade, "📊")
     q_label = f"{summary.quarter}Q累計"
 
-    # 修正・増配ラベル
-    event_labels = []
+    event_parts = []
     if summary.has_upward_revision:
-        event_labels.append("上方修正あり ✅")
+        event_parts.append("上方修正 ✅")
     if summary.has_dividend_increase:
-        event_labels.append("増配あり 💰")
-    event_str = " / ".join(event_labels) if event_labels else "修正なし"
+        event_parts.append("増配 💰")
+    event_str = " / ".join(event_parts) if event_parts else "修正なし"
 
-    # 利益率
-    margin_str = "取得不可"
     if score.margin_now is not None and score.margin_yoy is not None:
         sign = "+" if score.margin_delta >= 0 else ""
         margin_str = (
-            f"{score.margin_now:.1f}% "
-            f"（前年同期: {score.margin_yoy:.1f}%, "
-            f"変化: {sign}{score.margin_delta:.1f}pt）"
+            f"{score.margin_now:.1f}%"
+            f"（前年同期:{score.margin_yoy:.1f}%  変化:{sign}{score.margin_delta:.1f}pt）"
         )
+    else:
+        margin_str = "算出不可（前Q/前年データ不足）"
 
-    # 株価・需給
-    price_str = "取得不可"
     if price_data:
-        vs = price_data["vs_index_20d"]
+        vs   = price_data["vs_index_20d"]
         sign = "+" if vs >= 0 else ""
-        price_str = (
-            f"終値 {price_data['today_close']:,.0f}円 / "
-            f"直近20日対TOPIX {sign}{vs:.1f}%"
-        )
+        price_str = f"{price_data['today_close']:,.0f}円  直近20日対TOPIX:{sign}{vs:.1f}%"
+    else:
+        price_str = "取得不可"
 
-    margin_d_str = "取得不可"
     if margin_data:
-        margin_d_str = (
-            f"信用倍率 {margin_data['ratio']:.1f}倍 "
-            f"（買い残 {margin_data['buy']:,.0f}株 / 売り残 {margin_data['sell']:,.0f}株）"
+        shinyo_str = (
+            f"信用倍率{margin_data['ratio']:.1f}倍"
+            f"（買:{margin_data['buy']:,.0f}株 / 売:{margin_data['sell']:,.0f}株）"
         )
+    else:
+        shinyo_str = "取得不可"
 
-    # 警告
     warning_str = "\n".join(score.warnings) if score.warnings else "なし"
 
-    # スコア内訳
-    score_detail = (
-        f"進捗スコア: {score.s_progress:.0f}/40 "
-        f"| モメンタム: {score.s_momentum:.0f}/30 "
-        f"| 修正/増配: {score.s_event:.0f}/30"
-    )
-
-    # 保守的据え置き判定
-    conservative_note = ""
-    if (
-        score.progress_delta > 15
-        and not summary.has_upward_revision
-        and not summary.has_dividend_increase
-    ):
-        conservative_note = (
-            "\n💡 **保守的据え置きに注意**: 進捗率が過去平均を大幅超過しているにもかかわらず"
-            "通期修正がありません。発表直後の失望売りリスクがある一方、"
-            "下期への期待材料として通期修正余地あり。"
+    conservative = ""
+    if score.progress_delta > 15 and not summary.has_upward_revision:
+        conservative = (
+            "\n💡 **保守的据え置きに注意**: 進捗率が大幅超過なのに通期修正なし。"
+            "失望売りリスクと通期修正余地が共存。"
         )
 
-    message = f"""## {emoji} 【{score.total_score}点：{score.grade}評価】 [{summary.code}] {summary.company_name}
-
-### 📈 業績サマリー ({q_label})
-- 営業利益進捗率: **{summary.progress_rate:.1f}%**（過去3年平均: {score.avg_progress_3y:.1f}% → **{score.progress_delta:+.1f}%の乖離**）
-- 単Q営業利益率: {margin_str}
-- イベント: {event_str}
-
-### ⚠️ 需給・織り込みチェック
-- 株価: {price_str}
-- 信用残: {margin_d_str}
-
-### 🔍 フィルター結果
-{warning_str}{conservative_note}
-
-### 📊 スコア内訳（{score.total_score}/100点）
-{score_detail}"""
-
-    return message
+    return (
+        f"## {emoji}【{score.total_score}点:{score.grade}評価】"
+        f"[{summary.code}] {summary.company_name}\n\n"
+        f"### 📈 業績サマリー（{q_label}）\n"
+        f"- 進捗率: **{summary.progress_rate:.1f}%**"
+        f"（過去3年平均:{score.avg_progress_3y:.1f}%  乖離:**{score.progress_delta:+.1f}%**）\n"
+        f"- 単Q営業利益率: {margin_str}\n"
+        f"- イベント: {event_str}\n\n"
+        f"### ⚠️ 需給・織り込みチェック\n"
+        f"- 株価: {price_str}\n"
+        f"- 信用残: {shinyo_str}\n\n"
+        f"### 🔍 フィルター\n"
+        f"{warning_str}{conservative}\n\n"
+        f"### 📊 スコア内訳（{score.total_score}/100点）\n"
+        f"進捗:{score.s_progress:.0f}/40  "
+        f"モメンタム:{score.s_momentum:.0f}/30  "
+        f"修正/増配:{score.s_event:.0f}/30"
+    )
