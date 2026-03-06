@@ -6,8 +6,8 @@ TDnet の銘柄別JSON（非公式・安定稼働）を使って
 Google Sheetsのhistoryシートに投入するスクリプト。
 
 【データ取得元】
-  https://www.release.tdnet.info/inbs/I_list_00.json?Sccode={code}&Sort=1
-  ・銘柄コード指定で過去5年分の開示一覧がJSONで返る
+  https://www.release.tdnet.info/inbs/I_list_00.html?Sccode={code}&Sort=1&page={n}
+  ・銘柄コード指定のHTMLページをスクレイピング（複数ページ対応）
   ・J-Quants不要・完全無料・リアルタイム検知と同一のXBRLパース処理を使用
 
 【銘柄一覧の取得方式（自動フォールバック）】
@@ -50,6 +50,7 @@ from pathlib import Path
 
 import requests
 import gspread
+from bs4 import BeautifulSoup
 from google.oauth2.service_account import Credentials
 
 # srcディレクトリをパスに追加してxbrl_parserを使い回す
@@ -60,11 +61,12 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 logger = logging.getLogger(__name__)
 
 # ── 定数 ──────────────────────────────────────────────────────────────────
-TDNET_JSON_URL   = "https://www.release.tdnet.info/inbs/I_list_00.json?Sccode={code}&Sort=1"
+# 銘柄コード指定でHTMLを取得するURL（複数ページ対応）
+TDNET_CODE_URL   = "https://www.release.tdnet.info/inbs/I_list_00.html"
+TDNET_BASE_URL   = "https://www.release.tdnet.info/inbs/"
 TDNET_LISTED_URL = "https://www.jpx.co.jp/markets/statistics-equities/misc/tvdivq0000001vg2-att/data_j.xls"
 
 # 東証グロース・スタンダードの銘柄コード範囲
-# 内国株は1000〜9999。プライムを除いた中小型が多い帯域をカバー
 CODE_RANGE_START = 1000
 CODE_RANGE_END   = 9999
 
@@ -173,55 +175,102 @@ def _fetch_from_jpx_xls(market: str) -> list[dict]:
 
 # ── TDnet銘柄別JSON取得 ───────────────────────────────────────────────────
 
-def fetch_xbrl_urls_for_code(code: str, retry: int = 0) -> list[dict]:
+def fetch_xbrl_urls_for_code(code: str) -> list[dict]:
     """
-    TDnetの銘柄別JSON（非公式）から決算短信のXBRL URL一覧を取得する。
+    TDnetの銘柄別HTMLページをスクレイピングして
+    決算短信・業績修正・配当修正のXBRL URL一覧を取得する。
+
+    URL: https://www.release.tdnet.info/inbs/I_list_00.html?Sccode={code}&Sort=1&page={n}
+    ・複数ページ対応（ページが無くなるまでループ）
+    ・訂正開示は除外
+    ・XBRLが添付されていない開示は除外
 
     Returns:
-        [{"doc_id": str, "title": str, "xbrl_zip_url": str, "code": str}, ...]
+        [{"doc_id": str, "title": str, "xbrl_zip_url": str,
+          "code": str, "company_name": str}, ...]
     """
-    url = TDNET_JSON_URL.format(code=code)
-    try:
-        res = requests.get(url, timeout=15)
-        if res.status_code == 429:
-            if retry < MAX_RETRY:
+    results = []
+    page    = 1
+    company_name = ""
+
+    while True:
+        try:
+            res = requests.get(
+                TDNET_CODE_URL,
+                params={"Sccode": code, "Sort": 1, "page": page},
+                timeout=15,
+            )
+            if res.status_code == 404:
+                break
+            if res.status_code == 429:
                 logger.warning(f"[{code}] 429 Rate limit. {SLEEP_ON_429}秒待機...")
                 time.sleep(SLEEP_ON_429)
-                return fetch_xbrl_urls_for_code(code, retry + 1)
-            return []
-        if res.status_code == 404:
-            return []
-        res.raise_for_status()
-        data = res.json()
-    except Exception as e:
-        logger.warning(f"[{code}] TDnet JSON取得失敗: {e}")
-        return []
+                continue
+            res.raise_for_status()
+            res.encoding = "utf-8"
+        except requests.RequestException as e:
+            logger.warning(f"[{code}] p{page} 取得失敗: {e}")
+            break
 
-    results = []
-    for item in data.get("list", []):
-        title     = item.get("title", "")
-        file_link = item.get("fileLink", "")
+        soup  = BeautifulSoup(res.content, "html.parser")
+        table = soup.find("table", id="main-list-table")
+        if not table:
+            break   # ページが存在しない = データなし
 
-        # 決算短信・修正のみ、訂正は除外
-        if not any(kw in title for kw in TARGET_KEYWORDS):
-            continue
-        if "訂正" in title:
-            continue
-        if not file_link or not file_link.endswith(".zip"):
-            continue
+        rows = table.find_all("tr")
+        found_in_page = False
 
-        doc_id = file_link.replace(".zip", "").replace(".ZIP", "")
-        # filelinkはパスのみの場合があるのでベースURLを付与
-        if not file_link.startswith("http"):
-            file_link = "https://www.release.tdnet.info/inbs/" + file_link
+        for tr in rows:
+            tds = tr.find_all("td")
+            if not tds:
+                continue
 
-        results.append({
-            "doc_id"      : doc_id,
-            "title"       : title,
-            "xbrl_zip_url": file_link,
-            "code"        : code,
-            "company_name": item.get("company", ""),
-        })
+            rec = {}
+            for td in tds:
+                classes = td.get("class", [])
+                if "kjCode"   in classes:
+                    rec["code"] = td.get_text(strip=True)[:4]
+                elif "kjName"  in classes:
+                    rec["name"] = td.get_text(strip=True)
+                    company_name = rec["name"]
+                elif "kjTitle" in classes:
+                    a = td.find("a")
+                    rec["title"] = a.get_text(strip=True) if a else ""
+                elif "kjXbrl"  in classes:
+                    a = td.find("a")
+                    if a and a.get("href", "").endswith(".zip"):
+                        href = a["href"]
+                        # href は相対パスまたは絶対パスの場合がある
+                        if href.startswith("http"):
+                            rec["xbrl_url"] = href
+                        else:
+                            rec["xbrl_url"] = TDNET_BASE_URL + href.lstrip("/")
+                        rec["doc_id"] = href.split("/")[-1].replace(".zip", "")
+
+            # 対象外スキップ
+            if not rec.get("title"):
+                continue
+            found_in_page = True
+            if not any(kw in rec["title"] for kw in TARGET_KEYWORDS):
+                continue
+            if "訂正" in rec["title"]:
+                continue
+            if not rec.get("xbrl_url"):
+                continue
+
+            results.append({
+                "doc_id"      : rec.get("doc_id", ""),
+                "title"       : rec["title"],
+                "xbrl_zip_url": rec["xbrl_url"],
+                "code"        : code,
+                "company_name": company_name,
+            })
+
+        if not found_in_page:
+            break   # 空ページ = 最終ページ超え
+
+        page += 1
+        time.sleep(0.5)   # ページ間の軽いsleep
 
     return results
 
